@@ -53,6 +53,28 @@ typedef struct GinOptions
 #define GIN_EXCLUSIVE  BUFFER_LOCK_EXCLUSIVE
 
 
+struct GinState;
+
+/*
+ * Opclass hooks of a payload index (payloadWidth > 0).
+ *
+ * metaUpdate computes the opaque metadata of an entry leaf tuple into
+ * out[0..maxlen) and returns its length (0: no metadata).  'oldmeta' is the
+ * tuple's current metadata (NULL, 0 if none); 'payloads' are the payloads
+ * being added, or all postings of the key when it becomes a posting tree.
+ * isBuild is true only when the complete posting list of the key is passed
+ * by index build.  isTree is true if the resulting tuple points to a
+ * posting tree.  The result may only widen what oldmeta describes.
+ */
+typedef struct GinPayloadOps
+{
+	int			(*metaUpdate) (struct GinState *ginstate,
+							   const char *oldmeta, int oldlen,
+							   const char *payloads, int npayloads,
+							   bool isBuild, bool isTree,
+							   char *out, int maxlen);
+} GinPayloadOps;
+
 /*
  * GinState: working data structure describing the index being worked on
  */
@@ -88,7 +110,43 @@ typedef struct GinState
 	bool		canPartialMatch[INDEX_MAX_KEYS];
 	/* Collations to pass to the support functions */
 	Oid			supportCollation[INDEX_MAX_KEYS];
+
+	/*
+	 * Posting payload width in bytes.  Zero for ordinary GIN, in which case
+	 * payloadOps is NULL and no payload code path is taken.
+	 */
+	int			payloadWidth;
+	const GinPayloadOps *payloadOps;
 } GinState;
+
+/*
+ * Entry-tree leaf tuples of a payload index may carry opaque per-key
+ * metadata, flagged by GIN_ITUP_HAS_META in t_info.  It is tail-anchored:
+ *
+ *		key | category | posting list, if any | pad | meta | uint16 metalen
+ *
+ * so it is found the same way for posting-list and posting-tree tuples.
+ * Interior entry tuples never carry it and always have the bit clear.
+ */
+#define GIN_ITUP_HAS_META		INDEX_AM_RESERVED_BIT
+#define GinItupHasMeta(itup)	(((itup)->t_info & GIN_ITUP_HAS_META) != 0)
+#define GIN_MAX_META_SIZE		1024
+
+static inline char *
+GinItupGetMeta(IndexTuple itup, int *len)
+{
+	uint16		metalen;
+	char	   *end = (char *) itup + IndexTupleSize(itup);
+
+	if (!GinItupHasMeta(itup))
+	{
+		*len = 0;
+		return NULL;
+	}
+	memcpy(&metalen, end - sizeof(uint16), sizeof(uint16));
+	*len = metalen;
+	return end - sizeof(uint16) - metalen;
+}
 
 
 /* ginutil.c */
@@ -123,6 +181,14 @@ extern void ginEntryInsert(GinState *ginstate,
 						   OffsetNumber attnum, Datum key, GinNullCategory category,
 						   ItemPointerData *items, uint32 nitem,
 						   GinStatsData *buildStats);
+
+/* ginEntryInsertPayload result flags */
+#define GIN_INSERT_META_WIDENED		0x01	/* posting-tree tuple rewritten */
+#define GIN_INSERT_TO_TREE			0x02	/* posting list became a tree */
+extern int	ginEntryInsertPayload(GinState *ginstate,
+								  OffsetNumber attnum, Datum key, GinNullCategory category,
+								  ItemPointerData *items, char *payloads, uint32 nitem,
+								  GinStatsData *buildStats);
 
 /* ginbtree.c */
 
@@ -223,6 +289,12 @@ extern void ginPrepareEntryScan(GinBtree btree, OffsetNumber attnum,
 extern void ginEntryFillRoot(GinBtree btree, Page root, BlockNumber lblkno, Page lpage, BlockNumber rblkno, Page rpage);
 extern ItemPointer ginReadTuple(GinState *ginstate, OffsetNumber attnum,
 								IndexTuple itup, int *nitems);
+extern IndexTuple GinFormTupleMeta(GinState *ginstate,
+								   OffsetNumber attnum, Datum key, GinNullCategory category,
+								   Pointer data, Size dataSize, int nipd,
+								   const char *meta, int metalen, bool errorTooBig);
+extern ItemPointer ginReadTuplePayload(GinState *ginstate, OffsetNumber attnum,
+									   IndexTuple itup, int *nitems, char **payloads);
 
 /* gindatapage.c */
 extern ItemPointer GinDataLeafPageGetItems(Page page, int *nitems, ItemPointerData advancePast);
@@ -447,6 +519,7 @@ typedef struct GinEntryAccumulator
 	OffsetNumber attnum;
 	bool		shouldSort;
 	ItemPointerData *list;
+	char	   *payloads;		/* parallel to list[], if payloadWidth > 0 */
 	uint32		maxcount;		/* allocated size of list[] */
 	uint32		count;			/* current number of list[] entries */
 } GinEntryAccumulator;
@@ -470,6 +543,14 @@ extern void ginBeginBAScan(BuildAccumulator *accum);
 extern ItemPointerData *ginGetBAEntry(BuildAccumulator *accum,
 									  OffsetNumber *attnum, Datum *key, GinNullCategory *category,
 									  uint32 *n);
+extern void ginInsertBAEntriesPayload(BuildAccumulator *accum,
+									  ItemPointer heapptr, OffsetNumber attnum,
+									  Datum *entries, GinNullCategory *categories,
+									  const char *payloads, int32 nentries);
+extern ItemPointerData *ginGetBAEntryPayload(BuildAccumulator *accum,
+											 OffsetNumber *attnum, Datum *key,
+											 GinNullCategory *category,
+											 uint32 *n, char **payloads);
 
 /* ginfast.c */
 

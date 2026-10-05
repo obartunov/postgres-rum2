@@ -419,6 +419,249 @@ ginEntryInsert(GinState *ginstate,
 }
 
 /*
+ * Payload index (ginstate->payloadWidth > 0) versions of
+ * addItemPointersToLeafTuple, buildFreshLeafTuple and ginEntryInsert.
+ * A posting is (TID, payload); leaf tuples carry the metadata computed by
+ * the opclass hook ginstate->payloadOps->metaUpdate.
+ */
+static int
+ginCallMetaUpdate(GinState *ginstate, const char *oldmeta, int oldlen,
+				  const char *payloads, int npayloads, bool isBuild,
+				  bool isTree, char *out)
+{
+	int			len;
+
+	len = ginstate->payloadOps->metaUpdate(ginstate, oldmeta, oldlen,
+										   payloads, npayloads,
+										   isBuild, isTree,
+										   out, GIN_MAX_META_SIZE);
+	if (len < 0 || len > GIN_MAX_META_SIZE)
+		elog(ERROR, "invalid GIN entry metadata length %d", len);
+	return len;
+}
+
+static IndexTuple
+addItemsToLeafTuplePayload(GinState *ginstate, IndexTuple old,
+						   ItemPointerData *items, char *payloads, uint32 nitem,
+						   GinStatsData *buildStats, Buffer buffer, int *flags)
+{
+	int			w = ginstate->payloadWidth;
+	bool		isBuild = (buildStats != NULL);
+	OffsetNumber attnum;
+	Datum		key;
+	GinNullCategory category;
+	IndexTuple	res = NULL;
+	ItemPointerData *newItems,
+			   *oldItems;
+	char	   *newPayloads,
+			   *oldPayloads;
+	int			oldNPosting,
+				newNPosting,
+				nwritten;
+	GinPostingList *compressedList;
+	char	   *oldmeta;
+	int			oldmetalen;
+	char		meta[GIN_MAX_META_SIZE];
+	int			metalen;
+
+	Assert(!GinIsPostingTree(old));
+
+	attnum = gintuple_get_attrnum(ginstate, old);
+	key = gintuple_get_key(ginstate, old, &category);
+	oldmeta = GinItupGetMeta(old, &oldmetalen);
+
+	oldItems = ginReadTuplePayload(ginstate, attnum, old, &oldNPosting, &oldPayloads);
+	newItems = ginMergeItemPointersPayload(items, payloads, nitem,
+										   oldItems, oldPayloads, oldNPosting,
+										   w, &newNPosting, &newPayloads);
+
+	metalen = ginCallMetaUpdate(ginstate, oldmeta, oldmetalen, payloads, nitem,
+								isBuild, false, meta);
+
+	compressedList = ginCompressPostingListPayload(newItems, newPayloads, w,
+												   newNPosting, GinMaxItemSize,
+												   &nwritten);
+	if (nwritten == newNPosting)
+		res = GinFormTupleMeta(ginstate, attnum, key, category,
+							   (char *) compressedList,
+							   SizeOfGinPostingList(compressedList),
+							   newNPosting, meta, metalen, false);
+	pfree(compressedList);
+
+	if (!res)
+	{
+		/*
+		 * Convert to a posting tree.  The metadata of a tree tuple must cover
+		 * every posting, since they are no longer next to the key.
+		 */
+		BlockNumber postingRoot;
+		char		treemeta[GIN_MAX_META_SIZE];
+		int			treemetalen;
+
+		treemetalen = ginCallMetaUpdate(ginstate, meta, metalen,
+										newPayloads, newNPosting,
+										false, true, treemeta);
+		postingRoot = createPostingTreePayload(ginstate->index,
+											   oldItems, oldPayloads, w,
+											   oldNPosting, buildStats, buffer);
+		ginInsertItemPointersPayload(ginstate->index, postingRoot,
+									 items, payloads, w, nitem, buildStats);
+		res = GinFormTupleMeta(ginstate, attnum, key, category, NULL, 0, 0,
+							   treemeta, treemetalen, true);
+		GinSetPostingTree(res, postingRoot);
+		*flags |= GIN_INSERT_TO_TREE;
+	}
+	pfree(newItems);
+	pfree(newPayloads);
+	if (oldItems)
+		pfree(oldItems);
+
+	return res;
+}
+
+static IndexTuple
+buildFreshLeafTuplePayload(GinState *ginstate,
+						   OffsetNumber attnum, Datum key, GinNullCategory category,
+						   ItemPointerData *items, char *payloads, uint32 nitem,
+						   GinStatsData *buildStats, Buffer buffer, int *flags)
+{
+	int			w = ginstate->payloadWidth;
+	IndexTuple	res = NULL;
+	GinPostingList *compressedList;
+	int			nwritten;
+	char		meta[GIN_MAX_META_SIZE];
+	int			metalen;
+
+	metalen = ginCallMetaUpdate(ginstate, NULL, 0, payloads, nitem,
+								buildStats != NULL, false, meta);
+
+	compressedList = ginCompressPostingListPayload(items, payloads, w, nitem,
+												   GinMaxItemSize, &nwritten);
+	if (nwritten == nitem)
+		res = GinFormTupleMeta(ginstate, attnum, key, category,
+							   (char *) compressedList,
+							   SizeOfGinPostingList(compressedList),
+							   nitem, meta, metalen, false);
+	pfree(compressedList);
+
+	if (!res)
+	{
+		BlockNumber postingRoot;
+		char		treemeta[GIN_MAX_META_SIZE];
+		int			treemetalen;
+
+		treemetalen = ginCallMetaUpdate(ginstate, meta, metalen, payloads, nitem,
+										false, true, treemeta);
+		/* form the tuple first, to fail quickly if the key is too big */
+		res = GinFormTupleMeta(ginstate, attnum, key, category, NULL, 0, 0,
+							   treemeta, treemetalen, true);
+		postingRoot = createPostingTreePayload(ginstate->index, items, payloads,
+											   w, nitem, buildStats, buffer);
+		GinSetPostingTree(res, postingRoot);
+		*flags |= GIN_INSERT_TO_TREE;
+	}
+
+	return res;
+}
+
+/*
+ * ginEntryInsert for a payload index.  payloads[] holds nitem * payloadWidth
+ * bytes parallel to items[].  Returns GIN_INSERT_* flags.
+ *
+ * For a posting-tree key, the entry tuple's metadata is updated (if the
+ * hook changes it) through the normal entry-tree replace, which may split
+ * the entry page, before the postings are inserted into the posting tree.
+ * So a posting is never reachable before the metadata that covers it; a
+ * crash in between leaves metadata wider than the postings, which is safe.
+ */
+int
+ginEntryInsertPayload(GinState *ginstate,
+					  OffsetNumber attnum, Datum key, GinNullCategory category,
+					  ItemPointerData *items, char *payloads, uint32 nitem,
+					  GinStatsData *buildStats)
+{
+	GinBtreeData btree;
+	GinBtreeEntryInsertData insertdata;
+	GinBtreeStack *stack;
+	IndexTuple	itup;
+	Page		page;
+	int			flags = 0;
+
+	Assert(ginstate->payloadWidth > 0 && ginstate->payloadOps != NULL);
+	insertdata.isDelete = false;
+
+	ginPrepareEntryScan(&btree, attnum, key, category, ginstate);
+	btree.isBuild = (buildStats != NULL);
+
+	stack = ginFindLeafPage(&btree, false, false);
+	page = BufferGetPage(stack->buffer);
+
+	if (btree.findItem(&btree, stack))
+	{
+		itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, stack->off));
+
+		if (GinIsPostingTree(itup))
+		{
+			BlockNumber rootPostingTree = GinGetPostingTree(itup);
+			char	   *oldmeta;
+			int			oldmetalen;
+			char		meta[GIN_MAX_META_SIZE];
+			int			metalen;
+
+			oldmeta = GinItupGetMeta(itup, &oldmetalen);
+			metalen = ginCallMetaUpdate(ginstate, oldmeta, oldmetalen,
+										payloads, nitem, buildStats != NULL,
+										true, meta);
+			if (metalen != oldmetalen || memcmp(meta, oldmeta, metalen) != 0)
+			{
+				GinNullCategory oldcategory;
+				Datum		oldkey = gintuple_get_key(ginstate, itup, &oldcategory);
+
+				itup = GinFormTupleMeta(ginstate, attnum, oldkey, oldcategory,
+										NULL, 0, 0, meta, metalen, true);
+				GinSetPostingTree(itup, rootPostingTree);
+				insertdata.isDelete = true;
+				insertdata.entry = itup;
+				ginInsertValue(&btree, stack, &insertdata, buildStats);
+				pfree(itup);
+				flags |= GIN_INSERT_META_WIDENED;
+			}
+			else
+			{
+				LockBuffer(stack->buffer, GIN_UNLOCK);
+				freeGinBtreeStack(stack);
+			}
+
+			ginInsertItemPointersPayload(ginstate->index, rootPostingTree,
+										 items, payloads, ginstate->payloadWidth,
+										 nitem, buildStats);
+			return flags;
+		}
+
+		CheckForSerializableConflictIn(ginstate->index, NULL,
+									   BufferGetBlockNumber(stack->buffer));
+		itup = addItemsToLeafTuplePayload(ginstate, itup, items, payloads, nitem,
+										  buildStats, stack->buffer, &flags);
+		insertdata.isDelete = true;
+	}
+	else
+	{
+		CheckForSerializableConflictIn(ginstate->index, NULL,
+									   BufferGetBlockNumber(stack->buffer));
+		itup = buildFreshLeafTuplePayload(ginstate, attnum, key, category,
+										  items, payloads, nitem, buildStats,
+										  stack->buffer, &flags);
+		if (buildStats)
+			buildStats->nEntries++;
+	}
+
+	insertdata.entry = itup;
+	ginInsertValue(&btree, stack, &insertdata, buildStats);
+	pfree(itup);
+	return flags;
+}
+
+/*
  * Extract index entries for a single indexable item, and add them to the
  * BuildAccumulator's state.
  *

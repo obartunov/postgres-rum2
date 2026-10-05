@@ -49,6 +49,13 @@ ginCombineData(RBTNode *existing, const RBTNode *newdata, void *arg)
 		eo->list = (ItemPointerData *)
 			repalloc_huge(eo->list, sizeof(ItemPointerData) * eo->maxcount);
 		accum->allocatedMemory += GetMemoryChunkSpace(eo->list);
+		if (accum->ginstate->payloadWidth > 0)
+		{
+			accum->allocatedMemory -= GetMemoryChunkSpace(eo->payloads);
+			eo->payloads = repalloc_huge(eo->payloads,
+										 (Size) accum->ginstate->payloadWidth * eo->maxcount);
+			accum->allocatedMemory += GetMemoryChunkSpace(eo->payloads);
+		}
 	}
 
 	/* If item pointers are not ordered, they will need to be sorted later */
@@ -64,6 +71,9 @@ ginCombineData(RBTNode *existing, const RBTNode *newdata, void *arg)
 	}
 
 	eo->list[eo->count] = en->list[0];
+	if (accum->ginstate->payloadWidth > 0)
+		memcpy(eo->payloads + (Size) eo->count * accum->ginstate->payloadWidth,
+			   en->payloads, accum->ginstate->payloadWidth);
 	eo->count++;
 }
 
@@ -251,6 +261,82 @@ qsortCompareItemPointers(const void *a, const void *b)
 	return res;
 }
 
+/*
+ * ginInsertBAEntry and ginInsertBAEntries for a payload index: payloads[]
+ * holds nentries * payloadWidth bytes, the payload of each entry.
+ */
+static void
+ginInsertBAEntryPayload(BuildAccumulator *accum,
+						ItemPointer heapptr, OffsetNumber attnum,
+						Datum key, GinNullCategory category,
+						const char *payload)
+{
+	int			w = accum->ginstate->payloadWidth;
+	GinEntryAccumulator eatmp;
+	GinEntryAccumulator *ea;
+	bool		isNew;
+
+	eatmp.attnum = attnum;
+	eatmp.key = key;
+	eatmp.category = category;
+	eatmp.list = heapptr;
+	eatmp.payloads = unconstify(char *, payload);
+
+	ea = (GinEntryAccumulator *) rbt_insert(accum->tree, (RBTNode *) &eatmp,
+											&isNew);
+	if (isNew)
+	{
+		if (category == GIN_CAT_NORM_KEY)
+			ea->key = getDatumCopy(accum, attnum, key);
+		ea->maxcount = DEF_NPTR;
+		ea->count = 1;
+		ea->shouldSort = false;
+		ea->list = palloc_array(ItemPointerData, DEF_NPTR);
+		ea->list[0] = *heapptr;
+		ea->payloads = palloc((Size) w * DEF_NPTR);
+		memcpy(ea->payloads, payload, w);
+		accum->allocatedMemory += GetMemoryChunkSpace(ea->list);
+		accum->allocatedMemory += GetMemoryChunkSpace(ea->payloads);
+	}
+}
+
+void
+ginInsertBAEntriesPayload(BuildAccumulator *accum,
+						  ItemPointer heapptr, OffsetNumber attnum,
+						  Datum *entries, GinNullCategory *categories,
+						  const char *payloads, int32 nentries)
+{
+	int			w = accum->ginstate->payloadWidth;
+	uint32		step = nentries;
+
+	Assert(w > 0);
+	if (nentries <= 0)
+		return;
+
+	Assert(ItemPointerIsValid(heapptr) && attnum >= FirstOffsetNumber);
+
+	/* same insertion order as ginInsertBAEntries */
+	step |= (step >> 1);
+	step |= (step >> 2);
+	step |= (step >> 4);
+	step |= (step >> 8);
+	step |= (step >> 16);
+	step >>= 1;
+	step++;
+
+	while (step > 0)
+	{
+		int			i;
+
+		for (i = step - 1; i < nentries && i >= 0; i += step << 1 /* *2 */ )
+			ginInsertBAEntryPayload(accum, heapptr, attnum,
+									entries[i], categories[i],
+									payloads + (Size) i * w);
+
+		step >>= 1;				/* /2 */
+	}
+}
+
 /* Prepare to read out the rbtree contents using ginGetBAEntry */
 void
 ginBeginBAScan(BuildAccumulator *accum)
@@ -289,4 +375,63 @@ ginGetBAEntry(BuildAccumulator *accum,
 			  qsortCompareItemPointers);
 
 	return list;
+}
+
+/*
+ * ginGetBAEntry for a payload index; *payloads is parallel to the result.
+ */
+static int
+qsortCompareIndexedItemPointers(const void *a, const void *b, void *arg)
+{
+	ItemPointerData *list = arg;
+
+	return ginCompareItemPointers(&list[*(const uint32 *) a],
+								  &list[*(const uint32 *) b]);
+}
+
+ItemPointerData *
+ginGetBAEntryPayload(BuildAccumulator *accum,
+					 OffsetNumber *attnum, Datum *key, GinNullCategory *category,
+					 uint32 *n, char **payloads)
+{
+	int			w = accum->ginstate->payloadWidth;
+	GinEntryAccumulator *entry;
+
+	Assert(w > 0);
+	entry = (GinEntryAccumulator *) rbt_iterate(&accum->tree_walk);
+	if (entry == NULL)
+		return NULL;			/* no more entries */
+
+	*attnum = entry->attnum;
+	*key = entry->key;
+	*category = entry->category;
+	*n = entry->count;
+
+	if (entry->shouldSort && entry->count > 1)
+	{
+		/* sort TIDs, carrying the payloads along */
+		uint32	   *perm = palloc_array(uint32, entry->count);
+		ItemPointerData *list = palloc_array(ItemPointerData, entry->count);
+		char	   *pl = palloc((Size) w * entry->count);
+
+		for (uint32 i = 0; i < entry->count; i++)
+			perm[i] = i;
+		qsort_arg(perm, entry->count, sizeof(uint32),
+				  qsortCompareIndexedItemPointers, entry->list);
+		for (uint32 i = 0; i < entry->count; i++)
+		{
+			list[i] = entry->list[perm[i]];
+			memcpy(pl + (Size) i * w, entry->payloads + (Size) perm[i] * w, w);
+			Assert(i == 0 || ginCompareItemPointers(&list[i - 1], &list[i]) < 0);
+		}
+		memcpy(entry->list, list, sizeof(ItemPointerData) * entry->count);
+		memcpy(entry->payloads, pl, (Size) w * entry->count);
+		pfree(perm);
+		pfree(list);
+		pfree(pl);
+		entry->shouldSort = false;
+	}
+
+	*payloads = entry->payloads;
+	return entry->list;
 }

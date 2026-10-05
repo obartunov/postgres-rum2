@@ -153,6 +153,69 @@ GinFormTuple(GinState *ginstate,
 }
 
 /*
+ * Form a leaf entry tuple of a payload index: like GinFormTuple, plus
+ * opaque per-key metadata stored at the tail of the tuple (see
+ * GIN_ITUP_HAS_META).  'data' is a payload posting list or NULL; with
+ * metalen == 0 the result is exactly what GinFormTuple builds.
+ */
+IndexTuple
+GinFormTupleMeta(GinState *ginstate,
+				 OffsetNumber attnum, Datum key, GinNullCategory category,
+				 Pointer data, Size dataSize, int nipd,
+				 const char *meta, int metalen, bool errorTooBig)
+{
+	IndexTuple	itup;
+	char	   *end;
+	uint16		len = metalen;
+
+	if (metalen == 0)
+		return GinFormTuple(ginstate, attnum, key, category, data, dataSize,
+							nipd, errorTooBig);
+
+	Assert(metalen > 0 && metalen <= GIN_MAX_META_SIZE);
+	itup = GinFormTuple(ginstate, attnum, key, category, NULL,
+						dataSize + metalen + sizeof(uint16), nipd, errorTooBig);
+	if (itup == NULL)
+		return NULL;
+
+	/* GinFormTuple zeroed the space; fill in posting list and metadata */
+	end = (char *) itup + IndexTupleSize(itup);
+	if (data)
+		memcpy(GinGetPosting(itup), data, dataSize);
+	memcpy(end - sizeof(uint16) - metalen, meta, metalen);
+	memcpy(end - sizeof(uint16), &len, sizeof(uint16));
+	itup->t_info |= GIN_ITUP_HAS_META;
+	return itup;
+}
+
+/*
+ * Read item pointers and payloads from a leaf entry tuple of a payload index.
+ */
+ItemPointer
+ginReadTuplePayload(GinState *ginstate, OffsetNumber attnum, IndexTuple itup,
+					int *nitems, char **payloads)
+{
+	int			nipd = GinGetNPosting(itup);
+	ItemPointer ipd;
+	int			ndecoded;
+
+	Assert(ginstate->payloadWidth > 0 && GinItupIsCompressed(itup));
+	if (nipd == 0)
+	{
+		*nitems = 0;
+		*payloads = NULL;
+		return NULL;
+	}
+	ipd = ginPostingListDecodePayload((GinPostingList *) GinGetPosting(itup),
+									  ginstate->payloadWidth, &ndecoded, payloads);
+	if (nipd != ndecoded)
+		elog(ERROR, "number of items mismatch in GIN entry tuple, %d in tuple header, %d decoded",
+			 nipd, ndecoded);
+	*nitems = nipd;
+	return ipd;
+}
+
+/*
  * Read item pointers from leaf entry tuple.
  *
  * Returns a palloc'd array of ItemPointers. The number of items is returned
@@ -198,11 +261,25 @@ ginReadTuple(GinState *ginstate, OffsetNumber attnum, IndexTuple itup,
  * block number is inserted into t_tid.
  */
 static IndexTuple
-GinFormInteriorTuple(IndexTuple itup, Page page, BlockNumber childblk)
+GinFormInteriorTuple(GinState *ginstate, IndexTuple itup, Page page,
+					 BlockNumber childblk)
 {
 	IndexTuple	nitup;
 
-	if (GinPageIsLeaf(page) && !GinIsPostingTree(itup))
+	if (GinItupHasMeta(itup))
+	{
+		/*
+		 * Metadata stays on the leaf.  Rebuild the key-only tuple, which is
+		 * what the branches below produce for a tuple without metadata.
+		 */
+		OffsetNumber attnum = gintuple_get_attrnum(ginstate, itup);
+		GinNullCategory category;
+		Datum		key = gintuple_get_key(ginstate, itup, &category);
+
+		Assert(GinPageIsLeaf(page));
+		nitup = GinFormTuple(ginstate, attnum, key, category, NULL, 0, 0, true);
+	}
+	else if (GinPageIsLeaf(page) && !GinIsPostingTree(itup))
 	{
 		/* Tuple contains a posting list, just copy stuff before that */
 		uint32		origsize = GinGetPostingOffset(itup);
@@ -223,6 +300,7 @@ GinFormInteriorTuple(IndexTuple itup, Page page, BlockNumber childblk)
 
 	/* Now insert the correct downlink */
 	GinSetDownlink(nitup, childblk);
+	Assert(!GinItupHasMeta(nitup));
 
 	return nitup;
 }
@@ -709,7 +787,7 @@ entryPrepareDownlink(GinBtree btree, Buffer lbuf)
 	itup = getRightMostTuple(lpage);
 
 	insertData = palloc_object(GinBtreeEntryInsertData);
-	insertData->entry = GinFormInteriorTuple(itup, lpage, lblkno);
+	insertData->entry = GinFormInteriorTuple(btree->ginstate, itup, lpage, lblkno);
 	insertData->isDelete = false;
 
 	return insertData;
@@ -717,7 +795,7 @@ entryPrepareDownlink(GinBtree btree, Buffer lbuf)
 
 /*
  * Fills new root by rightest values from child.
- * Also called from ginxlog, should not use btree
+ * Not called during WAL replay; btree->ginstate is valid.
  */
 void
 ginEntryFillRoot(GinBtree btree, Page root,
@@ -726,12 +804,12 @@ ginEntryFillRoot(GinBtree btree, Page root,
 {
 	IndexTuple	itup;
 
-	itup = GinFormInteriorTuple(getRightMostTuple(lpage), lpage, lblkno);
+	itup = GinFormInteriorTuple(btree->ginstate, getRightMostTuple(lpage), lpage, lblkno);
 	if (PageAddItem(root, itup, IndexTupleSize(itup), InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
 		elog(ERROR, "failed to add item to index root page");
 	pfree(itup);
 
-	itup = GinFormInteriorTuple(getRightMostTuple(rpage), rpage, rblkno);
+	itup = GinFormInteriorTuple(btree->ginstate, getRightMostTuple(rpage), rpage, rblkno);
 	if (PageAddItem(root, itup, IndexTupleSize(itup), InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
 		elog(ERROR, "failed to add item to index root page");
 	pfree(itup);

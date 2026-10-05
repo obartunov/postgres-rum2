@@ -390,6 +390,79 @@ GinInitMetabuffer(Buffer b)
 }
 
 /*
+ * Initialize the metapage of an index whose postings carry payloadWidth
+ * bytes of payload: version GIN_PAYLOAD_VERSION, followed by GinMetaPageExt.
+ */
+void
+GinInitMetabufferPayload(Buffer b, int payloadWidth)
+{
+	Page		page = BufferGetPage(b);
+	GinMetaPageExt *ext;
+
+	if (payloadWidth <= 0 || payloadWidth > GIN_MAX_PAYLOAD_WIDTH)
+		elog(ERROR, "unsupported GIN posting payload width %d", payloadWidth);
+
+	GinInitMetabuffer(b);
+	GinPageGetMeta(page)->ginVersion = GIN_PAYLOAD_VERSION;
+	ext = GinPageGetMetaExt(page);
+	memset(ext, 0, sizeof(GinMetaPageExt));
+	ext->payloadWidth = payloadWidth;
+	((PageHeader) page)->pd_lower = ((char *) ext + sizeof(GinMetaPageExt)) - (char *) page;
+}
+
+/*
+ * Store the opaque index-level static metadata of a payload index.  Only
+ * index build calls this; the build WAL-logs all pages afterwards.
+ */
+void
+ginSetIndexStaticMeta(Relation index, const char *data, int len)
+{
+	Buffer		metabuffer;
+	Page		metapage;
+	GinMetaPageExt *ext;
+
+	if (len < 0 || len > GIN_INDEX_STATIC_META_MAX)
+		elog(ERROR, "GIN index static metadata too long: %d", len);
+
+	metabuffer = ReadBuffer(index, GIN_METAPAGE_BLKNO);
+	LockBuffer(metabuffer, GIN_EXCLUSIVE);
+	metapage = BufferGetPage(metabuffer);
+	if (GinPageGetMeta(metapage)->ginVersion != GIN_PAYLOAD_VERSION)
+		elog(ERROR, "index \"%s\" has no GIN payload capability",
+			 RelationGetRelationName(index));
+	ext = GinPageGetMetaExt(metapage);
+
+	START_CRIT_SECTION();
+	memcpy(ext->staticMeta, data, len);
+	ext->staticMetaLen = len;
+	MarkBufferDirty(metabuffer);
+	END_CRIT_SECTION();
+
+	UnlockReleaseBuffer(metabuffer);
+}
+
+/*
+ * Read the GinMetaPageExt of a payload index.  Returns false for an index
+ * without payload capability (version < GIN_PAYLOAD_VERSION).
+ */
+bool
+ginGetMetaExt(Relation index, GinMetaPageExt *ext)
+{
+	Buffer		metabuffer;
+	Page		metapage;
+	bool		found;
+
+	metabuffer = ReadBuffer(index, GIN_METAPAGE_BLKNO);
+	LockBuffer(metabuffer, GIN_SHARE);
+	metapage = BufferGetPage(metabuffer);
+	found = (GinPageGetMeta(metapage)->ginVersion == GIN_PAYLOAD_VERSION);
+	if (found)
+		memcpy(ext, GinPageGetMetaExt(metapage), sizeof(GinMetaPageExt));
+	UnlockReleaseBuffer(metabuffer);
+	return found;
+}
+
+/*
  * Support for sorting key datums and detecting duplicates in
  * ginExtractEntries
  */
@@ -629,6 +702,9 @@ ginUpdateStats(Relation index, const GinStatsData *stats, bool is_build)
 	 */
 	((PageHeader) metapage)->pd_lower =
 		((char *) metadata + sizeof(GinMetaPageData)) - (char *) metapage;
+	if (metadata->ginVersion == GIN_PAYLOAD_VERSION)
+		((PageHeader) metapage)->pd_lower =
+			((char *) GinPageGetMetaExt(metapage) + sizeof(GinMetaPageExt)) - (char *) metapage;
 
 	MarkBufferDirty(metabuffer);
 
@@ -645,6 +721,13 @@ ginUpdateStats(Relation index, const GinStatsData *stats, bool is_build)
 		XLogBeginInsert();
 		XLogRegisterData(&data, sizeof(ginxlogUpdateMeta));
 		XLogRegisterBuffer(0, metabuffer, REGBUF_WILL_INIT | REGBUF_STANDARD);
+
+		/*
+		 * Redo re-initializes the metapage, so a payload index must carry
+		 * its GinMetaPageExt in the record.
+		 */
+		if (metadata->ginVersion == GIN_PAYLOAD_VERSION)
+			XLogRegisterBufData(0, GinPageGetMetaExt(metapage), sizeof(GinMetaPageExt));
 
 		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_UPDATE_META_PAGE);
 		PageSetLSN(metapage, recptr);

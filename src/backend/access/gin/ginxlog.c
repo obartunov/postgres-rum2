@@ -543,6 +543,17 @@ ginRedoUpdateMetapage(XLogReaderState *record)
 
 	GinInitMetabuffer(metabuffer);
 	memcpy(GinPageGetMeta(metapage), &data->metadata, sizeof(GinMetaPageData));
+	if (data->metadata.ginVersion == GIN_PAYLOAD_VERSION)
+	{
+		Size		extlen;
+		char	   *ext = XLogRecGetBlockData(record, 0, &extlen);
+
+		if (ext == NULL || extlen != sizeof(GinMetaPageExt))
+			elog(PANIC, "gin_redo: GIN payload metapage record without extension data");
+		memcpy(GinPageGetMetaExt(metapage), ext, extlen);
+		((PageHeader) metapage)->pd_lower =
+			((char *) GinPageGetMetaExt(metapage) + sizeof(GinMetaPageExt)) - (char *) metapage;
+	}
 	PageSetLSN(metapage, lsn);
 	MarkBufferDirty(metabuffer);
 

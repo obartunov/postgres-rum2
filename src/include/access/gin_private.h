@@ -98,6 +98,9 @@ extern Buffer GinNewBuffer(Relation index);
 extern void GinInitBuffer(Buffer b, uint32 f);
 extern void GinInitPage(Page page, uint32 f, Size pageSize);
 extern void GinInitMetabuffer(Buffer b);
+extern void GinInitMetabufferPayload(Buffer b, int payloadWidth);
+extern void ginSetIndexStaticMeta(Relation index, const char *data, int len);
+extern bool ginGetMetaExt(Relation index, GinMetaPageExt *ext);
 extern Datum *ginExtractEntries(GinState *ginstate, OffsetNumber attnum,
 								Datum value, bool isNull,
 								int32 *nentries_p, GinNullCategory **categories_p);

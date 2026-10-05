@@ -102,6 +102,28 @@ typedef struct GinMetaPageData
 
 #define GIN_CURRENT_VERSION		2
 
+/*
+ * Version 3 marks an index whose posting lists carry a fixed-width opaque
+ * payload per item (see GinPostingList below).  Such an index has a
+ * GinMetaPageExt after GinMetaPageData on the metapage.  Indexes of version
+ * 2 and older never have it and are read exactly as before.
+ */
+#define GIN_PAYLOAD_VERSION		3
+
+#define GIN_MAX_PAYLOAD_WIDTH	8	/* policy of the current implementation */
+#define GIN_INDEX_STATIC_META_MAX	64
+
+typedef struct GinMetaPageExt
+{
+	uint8		payloadWidth;	/* bytes of payload per posting, > 0 */
+	uint8		staticMetaLen;	/* bytes used in staticMeta[] */
+	char		staticMeta[GIN_INDEX_STATIC_META_MAX];	/* opaque to GIN; set
+														 * by index build only */
+} GinMetaPageExt;
+
+#define GinPageGetMetaExt(p) \
+	((GinMetaPageExt *) ((char *) GinPageGetMeta(p) + MAXALIGN(sizeof(GinMetaPageData))))
+
 #define GinPageGetMeta(p) \
 	((GinMetaPageData *) PageGetContents(p))
 

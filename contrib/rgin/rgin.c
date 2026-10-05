@@ -50,6 +50,8 @@
 #include "nodes/pathnodes.h"
 #include "storage/bufmgr.h"
 #include "tsearch/ts_type.h"
+#include "catalog/pg_type.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/index_selfuncs.h"
@@ -1243,6 +1245,7 @@ PG_FUNCTION_INFO_V1(rgin_last_stats);
 PG_FUNCTION_INFO_V1(rgin_build_info);
 PG_FUNCTION_INFO_V1(rgin_widen_events);
 PG_FUNCTION_INFO_V1(rgin_term_frontier);
+PG_FUNCTION_INFO_V1(rgin_term_frontier_points);
 
 Datum
 rgin_handler(PG_FUNCTION_ARGS)
@@ -1384,6 +1387,32 @@ rgin_term_frontier(PG_FUNCTION_ARGS)
 			m += RGIN_IS_POINT(&pts[j]);
 		PG_RETURN_INT32(m);
 	}
+}
+
+/* stored root-frontier points of a term as tf_byte*256 + norm_code */
+Datum
+rgin_term_frontier_points(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	text	   *lex = PG_GETARG_TEXT_PP(1);
+	Relation	index = index_open(indexoid, AccessShareLock);
+	GinState	gs;
+	int			n,
+				m = 0;
+	ItemPointer pts;
+	Datum	   *d;
+
+	if (!rgin_is_rgin_index(index))
+		elog(ERROR, "not an rgin index");
+	initGinState(&gs, index);
+	pts = rgin_read_magic(index, &gs, RGIN_TAG_FRONTIER, VARDATA_ANY(lex),
+						  VARSIZE_ANY_EXHDR(lex), &n);
+	index_close(index, NoLock);
+	d = palloc(sizeof(Datum) * Max(n, 1));
+	for (int j = 0; pts && j < n; j++)
+		if (RGIN_IS_POINT(&pts[j]))
+			d[m++] = Int32GetDatum((int32) rgin_item_to_point(&pts[j]));
+	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(d, m, INT4OID));
 }
 
 void

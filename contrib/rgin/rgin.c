@@ -46,6 +46,7 @@
 #include "catalog/index.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "nodes/pathnodes.h"
 #include "storage/bufmgr.h"
 #include "tsearch/ts_type.h"
@@ -277,6 +278,9 @@ typedef struct RginStats
 	int64		emitted;
 	bool		fallback;
 	int64		full_docs;
+	double		full_merge_ms;	/* FULL: cursor merge + scoring */
+	double		full_sort_ms;	/* FULL: heapify of all scored docs */
+	double		phase_ms;		/* C: time inside phases */
 } RginStats;
 
 static RginStats last_stats;
@@ -549,7 +553,6 @@ typedef struct RginScanOpaqueData
 	bool		in_full;
 	PoolEntry  *full;
 	int64		nfull;
-	int64		fullpos;
 	double	   *contrib;
 	bool	   *has;
 	RginStats	st;
@@ -633,6 +636,14 @@ cursor_seek(Relation index, RginScanOpaque so, RginCursor *c, uint64 target)
 			return false;
 		if (c->pos < c->nitems)
 		{
+			/* sequential access: the next posting usually qualifies */
+			if (rgin_rk(&c->items[c->pos]) >= target)
+				return true;
+			if (c->pos + 1 < c->nitems && rgin_rk(&c->items[c->pos + 1]) >= target)
+			{
+				c->pos++;
+				return true;
+			}
 			if (rgin_rk(&c->items[c->nitems - 1]) >= target)
 			{
 				int			lo = c->pos,
@@ -705,19 +716,6 @@ better(const PoolEntry *a, const PoolEntry *b)
 	return a->score > b->score || (a->score == b->score && a->rk < b->rk);
 }
 
-static int
-pool_cmp(const void *a, const void *b)
-{
-	const PoolEntry *x = a,
-			   *y = b;
-
-	if (better(x, y))
-		return -1;
-	if (better(y, x))
-		return 1;
-	return 0;
-}
-
 static void
 pool_push(RginScanOpaque so, double score, uint64 rk)
 {
@@ -748,13 +746,9 @@ pool_push(RginScanOpaque so, double score, uint64 rk)
 	so->st.pool_peak_bytes = Max(so->st.pool_peak_bytes, so->poolcap * (int64) sizeof(PoolEntry));
 }
 
-static PoolEntry
-pool_pop(RginScanOpaque so)
+static void
+sift_down(PoolEntry *h, int64 n, int64 i)
 {
-	PoolEntry	top = so->pool[0];
-	int64		i = 0;
-
-	so->pool[0] = so->pool[--so->npool];
 	for (;;)
 	{
 		int64		l = 2 * i + 1,
@@ -762,18 +756,33 @@ pool_pop(RginScanOpaque so)
 					m = i;
 		PoolEntry	t;
 
-		if (l < so->npool && better(&so->pool[l], &so->pool[m]))
+		if (l < n && better(&h[l], &h[m]))
 			m = l;
-		if (r < so->npool && better(&so->pool[r], &so->pool[m]))
+		if (r < n && better(&h[r], &h[m]))
 			m = r;
 		if (m == i)
 			break;
-		t = so->pool[m];
-		so->pool[m] = so->pool[i];
-		so->pool[i] = t;
+		t = h[m];
+		h[m] = h[i];
+		h[i] = t;
 		i = m;
 	}
+}
+
+static PoolEntry
+heap_pop(PoolEntry *h, int64 *n)
+{
+	PoolEntry	top = h[0];
+
+	h[0] = h[--(*n)];
+	sift_down(h, *n, 0);
 	return top;
+}
+
+static PoolEntry
+pool_pop(RginScanOpaque so)
+{
+	return heap_pop(so->pool, &so->npool);
 }
 
 /* exact score of a document from per-term contributions, datum term order */
@@ -800,6 +809,10 @@ run_full(IndexScanDesc scan)
 	bool	   *valid = palloc(sizeof(bool) * nt);
 	int64		cap = 1024;
 
+	instr_time	t0,
+				t1;
+
+	INSTR_TIME_SET_CURRENT(t0);
 	so->full = MemoryContextAllocHuge(so->ctx, sizeof(PoolEntry) * cap);
 	so->nfull = 0;
 	for (int i = 0; i < nt; i++)
@@ -840,7 +853,15 @@ run_full(IndexScanDesc scan)
 	}
 	for (int i = 0; i < nt; i++)
 		cursor_close(&cur[i]);
-	qsort(so->full, so->nfull, sizeof(PoolEntry), pool_cmp);
+	INSTR_TIME_SET_CURRENT(t1);
+	INSTR_TIME_SUBTRACT(t1, t0);
+	so->st.full_merge_ms += INSTR_TIME_GET_MILLISEC(t1);
+	INSTR_TIME_SET_CURRENT(t0);
+	for (int64 i = so->nfull / 2 - 1; i >= 0; i--)
+		sift_down(so->full, so->nfull, i);
+	INSTR_TIME_SET_CURRENT(t1);
+	INSTR_TIME_SUBTRACT(t1, t0);
+	so->st.full_sort_ms += INSTR_TIME_GET_MILLISEC(t1);
 	so->st.docs_scored += so->nfull;
 	so->st.full_docs = so->nfull;
 	so->in_full = true;
@@ -862,6 +883,10 @@ run_phase(IndexScanDesc scan)
 	int64		limit = (int64) rgin_pool_limit_kb * 1024;
 	bool		ok = true;
 	bool		valid;
+	instr_time	t0,
+				t1;
+
+	INSTR_TIME_SET_CURRENT(t0);
 
 	for (int i = 0; i < nt; i++)
 		cursor_open(index, so, &cur[i], i);
@@ -913,6 +938,9 @@ run_phase(IndexScanDesc scan)
 	}
 	for (int i = 0; i < nt; i++)
 		cursor_close(&cur[i]);
+	INSTR_TIME_SET_CURRENT(t1);
+	INSTR_TIME_SUBTRACT(t1, t0);
+	so->st.phase_ms += INSTR_TIME_GET_MILLISEC(t1);
 	if (!ok)
 		return false;
 
@@ -996,7 +1024,7 @@ rginrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	so->pool = NULL;
 	so->npool = so->poolcap = 0;
 	so->full = NULL;
-	so->nfull = so->fullpos = 0;
+	so->nfull = 0;
 	so->in_full = false;
 	so->phases_done = 0;
 	so->empty = false;
@@ -1134,8 +1162,8 @@ rgingettuple(IndexScanDesc scan, ScanDirection dir)
 	{
 		if (so->in_full)
 		{
-			if (so->fullpos < so->nfull)
-				result = emit(scan, so->full[so->fullpos++]);
+			if (so->nfull > 0)
+				result = emit(scan, heap_pop(so->full, &so->nfull));
 			break;
 		}
 		if (so->npool > 0)
@@ -1165,7 +1193,8 @@ rgingettuple(IndexScanDesc scan, ScanDirection dir)
 			so->pool = NULL;
 			so->npool = so->poolcap = 0;
 			run_full(scan);
-			so->fullpos = Min(emitted, so->nfull);
+			for (int64 i = 0; i < emitted && so->nfull > 0; i++)
+				(void) heap_pop(so->full, &so->nfull);
 		}
 	}
 	MemoryContextSwitchTo(old);
@@ -1296,12 +1325,13 @@ rgin_last_stats(PG_FUNCTION_ARGS)
 					 ",\"docs_scored\":" INT64_FORMAT ",\"contribs\":" INT64_FORMAT
 					 ",\"bound_evals\":" INT64_FORMAT ",\"pool_peak\":" INT64_FORMAT
 					 ",\"pool_peak_bytes\":" INT64_FORMAT ",\"emitted\":" INT64_FORMAT
-					 ",\"fallback\":%s,\"full_docs\":" INT64_FORMAT "}",
+					 ",\"fallback\":%s,\"full_docs\":" INT64_FORMAT
+					 ",\"full_merge_ms\":%.3f,\"full_sort_ms\":%.3f,\"phase_ms\":%.3f}",
 					 st->strategy ? st->strategy : "", st->nterms, st->phases,
 					 st->postings, st->leaf_pages, st->descents, st->seeks,
 					 st->docs_scored, st->contribs, st->bound_evals, st->pool_peak,
 					 st->pool_peak_bytes, st->emitted, st->fallback ? "true" : "false",
-					 st->full_docs);
+					 st->full_docs, st->full_merge_ms, st->full_sort_ms, st->phase_ms);
 	PG_RETURN_TEXT_P(cstring_to_text(s.data));
 }
 

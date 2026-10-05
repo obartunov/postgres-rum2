@@ -33,6 +33,7 @@
 #include "storage/predicate.h"
 #include "tcop/tcopprot.h"
 #include "utils/datum.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
@@ -510,6 +511,7 @@ addItemsToLeafTuplePayload(GinState *ginstate, IndexTuple old,
 							   treemeta, treemetalen, true);
 		GinSetPostingTree(res, postingRoot);
 		*flags |= GIN_INSERT_TO_TREE;
+		INJECTION_POINT("gin-payload-after-tree-create", NULL);
 	}
 	pfree(newItems);
 	pfree(newPayloads);
@@ -625,6 +627,7 @@ ginEntryInsertPayload(GinState *ginstate,
 				ginInsertValue(&btree, stack, &insertdata, buildStats);
 				pfree(itup);
 				flags |= GIN_INSERT_META_WIDENED;
+				INJECTION_POINT("gin-payload-after-meta-widen", NULL);
 			}
 			else
 			{

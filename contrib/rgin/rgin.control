@@ -1,0 +1,4 @@
+comment = 'research ranked GIN access method (M1 prototype, not for production)'
+default_version = '1.0'
+module_pathname = '$libdir/rgin'
+relocatable = true

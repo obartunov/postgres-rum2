@@ -1,35 +1,26 @@
 /*
  * rgin.c
- *		Research ranked GIN access method (M1 prototype).  Not for production.
+ *		Research ranked GIN access method (M2 prototype).  Not for production.
  *
- * rgin reuses the stock GIN page formats, entry tree, posting trees, WAL
- * and build accumulator unchanged.  It differs from GIN in three places:
+ * rgin is an AM wrapper over the GIN payload format (metapage version 3):
  *
- *	1. Posting payload.  Each posting stores a "pseudo item pointer" that
- *	   packs the heap TID and a 16-bit client payload:
- *			V  = ((blk << 9 | off) << 16) | payload
- *			ip = item pointer with (block, offset) = split of 2*V+1
- *	   Pseudo items sort by (heap TID, payload), so per-key posting lists
- *	   stay in heap TID order and GIN's compression, page split and merge
- *	   code work on them unmodified.  The extra bits cost about two bytes
- *	   per posting in the varbyte deltas.  Research limit: heap block
- *	   < 2^17 (1 GB of 8 kB pages), heap offset < 512.
+ *	1. Posting payload.  Every posting is (heap TID, 2 opaque bytes); core
+ *	   GIN stores them as P2 segments (TID stream, then a payload array).
  *
- *	2. Root summary and generation.  Per term, a Pareto set of payloads
- *	   (the root frontier) is stored as an ordinary GIN entry under a
- *	   "magic" key (tag byte + lexeme) whose fake item pointers encode
- *	   the points.  df at build, N and sum(dl) are stored the same way.
- *	   No format change; the build-time values are the statistics
- *	   generation G of M0.7 and are never updated.
+ *	2. Per-key metadata in the entry leaf tuple, computed by the opclass
+ *	   hook (rgin_bm25.c): build-time df_G, and for posting-tree keys the
+ *	   root Pareto frontier of payloads.  N_G and sum(dl)_G are the index
+ *	   static metadata on the metapage.  Together they are the statistics
+ *	   generation G of M0.7; inserts never change them.
  *
  *	3. Ordered scan.  amgettuple returns an exact score-ordered stream
  *	   (score desc, heap TID asc) without knowing LIMIT: either FULL
- *	   (decode all eligible postings, score, sort) or C (M0.6 incremental
+ *	   (decode all eligible postings, score, heap) or C (M0.6 incremental
  *	   phases over terms by decreasing root bound, nothing discarded).
  *
- * Research-only restrictions: fastupdate=off, single-column, serial build
- * in one accumulator pass, no bitmap scans, no bulk delete, no partial
- * match, append-only (frontier only widens).
+ * Research-only restrictions: fastupdate=off, single-column, serial build,
+ * no bitmap scans, no bulk delete (VACUUM with dead tuples errors out), no
+ * partial match, append-only.
  */
 #include "postgres.h"
 
@@ -44,13 +35,13 @@
 #include "access/tableam.h"
 #include "access/xloginsert.h"
 #include "catalog/index.h"
+#include "catalog/pg_type.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
-#include "portability/instr_time.h"
 #include "nodes/pathnodes.h"
+#include "portability/instr_time.h"
 #include "storage/bufmgr.h"
 #include "tsearch/ts_type.h"
-#include "catalog/pg_type.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -61,7 +52,7 @@
 
 #include "rgin.h"
 
-PG_MODULE_MAGIC_EXT(.name = "rgin",.version = "1.0-m1");
+PG_MODULE_MAGIC_EXT(.name = "rgin",.version = "2.0-m2");
 
 /* ---------------------------------------------------------------- GUCs */
 
@@ -79,173 +70,135 @@ static const struct config_enum_entry strategy_options[] = {
 	{NULL, 0, false}
 };
 
+enum
+{
+	RGIN_DECODE_PAGE,			/* decode from covering segment to end of page */
+	RGIN_DECODE_SEGMENT			/* decode exactly one segment at a time */
+};
+
+static const struct config_enum_entry decode_options[] = {
+	{"page", RGIN_DECODE_PAGE, false},
+	{"segment", RGIN_DECODE_SEGMENT, false},
+	{NULL, 0, false}
+};
+
 static int	rgin_strategy = RGIN_STRATEGY_AUTO;
+static int	rgin_decode = RGIN_DECODE_PAGE;
 static int	rgin_pool_limit_kb = 65536;
 static bool rgin_verify = false;
-static bool rgin_build_evidence = true;
 
-/* ---------------------------------------------------------------- pseudo items */
+#define W	RGIN_PAYLOAD_WIDTH
 
-#define RGIN_OFF_BITS		9
-#define RGIN_MAX_BLOCK		((BlockNumber) 1 << 17)
-
+/* heap TID as a sortable 64-bit key */
 static inline uint64
-ip_u64(ItemPointer ip)
+tid_key(const ItemPointerData *ip)
 {
-	return ((uint64) GinItemPointerGetBlockNumber(ip) << 11) |
+	return ((uint64) GinItemPointerGetBlockNumber(ip) << 16) |
 		GinItemPointerGetOffsetNumber(ip);
 }
 
-static inline ItemPointerData
-u64_ip(uint64 v)
-{
-	ItemPointerData ip;
-
-	ItemPointerSetBlockNumber(&ip, (BlockNumber) (v >> 11));
-	ip.ip_posid = (OffsetNumber) (v & 2047);
-	return ip;
-}
-
-static inline ItemPointerData
-rgin_encode(ItemPointer heaptid, RginPayload p)
-{
-	BlockNumber blk = ItemPointerGetBlockNumber(heaptid);
-	OffsetNumber off = ItemPointerGetOffsetNumber(heaptid);
-	uint64		rk;
-
-	if (blk >= RGIN_MAX_BLOCK || off >= (1 << RGIN_OFF_BITS))
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("rgin research prototype: heap TID (%u,%u) out of encodable range",
-						blk, off)));
-	rk = ((uint64) blk << RGIN_OFF_BITS) | off;
-	return u64_ip((((rk << 16) | p) << 1) | 1);
-}
-
-/* heap row key (blk << 9 | off) of a pseudo item */
-static inline uint64
-rgin_rk(ItemPointer ip)
-{
-	return ip_u64(ip) >> 17;
-}
-
-static inline RginPayload
-rgin_payload(ItemPointer ip)
-{
-	return (RginPayload) ((ip_u64(ip) >> 1) & 0xffff);
-}
-
 static inline void
-rk_to_tid(uint64 rk, ItemPointer tid)
+key_to_tid(uint64 k, ItemPointer tid)
 {
-	ItemPointerSet(tid, (BlockNumber) (rk >> RGIN_OFF_BITS),
-				   (OffsetNumber) (rk & ((1 << RGIN_OFF_BITS) - 1)));
-}
-
-/* ---------------------------------------------------------------- magic entries */
-
-static Datum
-magic_key(char tag, const char *lex, int len)
-{
-	text	   *t = (text *) palloc(VARHDRSZ + 1 + len);
-
-	SET_VARSIZE(t, VARHDRSZ + 1 + len);
-	VARDATA(t)[0] = tag;
-	memcpy(VARDATA(t) + 1, lex, len);
-	return PointerGetDatum(t);
+	ItemPointerSet(tid, (BlockNumber) (k >> 16), (OffsetNumber) (k & 0xffff));
 }
 
 /*
- * Look up an entry key.  Returns true if found; then either *root is a
- * posting tree root, or *items and *n are the decoded inline posting list.
+ * Largest item pointer that sorts before key k, as GIN's advancePast hint
+ * ("items > advancePast").  Invalid (no skipping) when k is the first TID.
  */
+static inline ItemPointerData
+advance_past(uint64 k)
+{
+	ItemPointerData ip;
+	BlockNumber blk = (BlockNumber) (k >> 16);
+	OffsetNumber off = (OffsetNumber) (k & 0xffff);
+
+	if (off > 1)
+		ItemPointerSet(&ip, blk, off - 1);
+	else if (blk > 0)
+		ItemPointerSet(&ip, blk - 1, 0xffff);
+	else
+		ItemPointerSetInvalid(&ip);
+	return ip;
+}
+
 static bool
-lookup_entry(Relation index, GinState *gs, Datum key,
-			 BlockNumber *root, ItemPointer *items, int *n)
+rgin_fastupdate(Relation index)
+{
+	return index->rd_options ? ((GinOptions *) index->rd_options)->useFastUpdate
+		: GIN_DEFAULT_USE_FASTUPDATE;
+}
+
+/* ---------------------------------------------------------------- state, lookup */
+
+void
+rgin_init_state(GinState *gs, Relation index)
+{
+	GinMetaPageExt ext;
+
+	initGinState(gs, index);
+	if (!ginGetMetaExt(index, &ext) || ext.payloadWidth != W)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" does not have the rgin payload format; REINDEX it",
+						RelationGetRelationName(index))));
+	gs->payloadWidth = W;
+	gs->payloadOps = &rgin_bm25_payload_ops;
+}
+
+void
+rgin_read_index_meta(Relation index, RginIndexMeta *im)
+{
+	GinMetaPageExt ext;
+
+	if (!ginGetMetaExt(index, &ext) || ext.staticMetaLen != sizeof(RginIndexMeta))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" has no rgin statistics generation",
+						RelationGetRelationName(index))));
+	memcpy(im, ext.staticMeta, sizeof(RginIndexMeta));
+}
+
+/*
+ * Look up a key.  Fills *ti with its metadata and either the posting tree
+ * root or (if wantItems) the decoded inline postings.
+ */
+void
+rgin_lookup_term(Relation index, GinState *gs, const char *lex, int len,
+				 bool wantItems, RginTermInfo *ti)
 {
 	GinBtreeData btree;
 	GinBtreeStack *stack;
-	bool		found;
+	Datum		key = PointerGetDatum(cstring_to_text_with_len(lex, len));
 
-	*root = InvalidBlockNumber;
-	*items = NULL;
-	*n = 0;
+	memset(ti, 0, sizeof(*ti));
+	ti->root = InvalidBlockNumber;
 	ginPrepareEntryScan(&btree, FirstOffsetNumber, key, GIN_CAT_NORM_KEY, gs);
 	stack = ginFindLeafPage(&btree, true, false);
-	found = btree.findItem(&btree, stack);
-	if (found)
+	if (btree.findItem(&btree, stack))
 	{
 		Page		page = BufferGetPage(stack->buffer);
 		IndexTuple	itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, stack->off));
+		char	   *meta = GinItupGetMeta(itup, &ti->metalen);
 
+		ti->found = true;
+		rgin_meta_parse(meta, ti->metalen, &ti->meta);
 		if (GinIsPostingTree(itup))
-			*root = GinGetPostingTree(itup);
-		else if (GinGetNPosting(itup) > 0)
-			*items = ginReadTuple(gs, FirstOffsetNumber, itup, n);
+		{
+			ti->isTree = true;
+			ti->root = GinGetPostingTree(itup);
+		}
+		else
+		{
+			ti->nitems = GinGetNPosting(itup);
+			if (wantItems && ti->nitems > 0)
+				ti->items = ginReadTuplePayload(gs, FirstOffsetNumber, itup,
+												&ti->nitems, &ti->payloads);
+		}
 	}
 	LockBuffer(stack->buffer, GIN_UNLOCK);
 	freeGinBtreeStack(stack);
-	return found;
-}
-
-ItemPointer
-rgin_read_magic(Relation index, GinState *gs, char tag,
-				const char *lex, int len, int *n)
-{
-	BlockNumber root;
-	ItemPointer items;
-
-	if (!lookup_entry(index, gs, magic_key(tag, lex, len), &root, &items, n))
-		return NULL;
-	if (root != InvalidBlockNumber)
-		elog(ERROR, "rgin: magic entry unexpectedly stored as posting tree");
-	return items;
-}
-
-static void
-insert_magic(GinState *gs, char tag, const char *lex, int len,
-			 ItemPointerData *items, int n, GinStatsData *buildStats)
-{
-	ginEntryInsert(gs, FirstOffsetNumber, magic_key(tag, lex, len),
-				   GIN_CAT_NORM_KEY, items, n, buildStats);
-}
-
-static void
-insert_scalar(GinState *gs, const char *name, int64 v, GinStatsData *buildStats)
-{
-	ItemPointerData ip;
-
-	if (v < 0 || v >= (int64) InvalidBlockNumber)
-		elog(ERROR, "rgin research prototype: statistic %s out of range", name);
-	ItemPointerSet(&ip, (BlockNumber) v, FirstOffsetNumber);
-	insert_magic(gs, RGIN_TAG_STATS, name, strlen(name), &ip, 1, buildStats);
-}
-
-/* Pareto frontier of payloads (tf high, norm low), sorted by tf asc */
-static int
-frontier_of(ItemPointerData *items, int n, ItemPointerData *out)
-{
-	int			best[256];
-	int			m = 0,
-				maxtf = -1;
-
-	for (int c = 0; c < 256; c++)
-		best[c] = -1;
-	for (int i = 0; i < n; i++)
-	{
-		RginPayload p = rgin_payload(&items[i]);
-
-		best[p & 0xff] = Max(best[p & 0xff], p >> 8);
-	}
-	for (int c = 0; c < 256; c++)
-	{
-		if (best[c] > maxtf)
-		{
-			out[m++] = rgin_point_to_item((RginPayload) ((best[c] << 8) | c));
-			maxtf = best[c];
-		}
-	}
-	return m;
 }
 
 /* ---------------------------------------------------------------- instrumentation */
@@ -256,19 +209,30 @@ typedef struct RginBuildInfo
 	int64		sumdl;
 	int64		terms;
 	int64		postings;
-	int64		frontier_points;
-	int64		frontier_hist[65];	/* [64] = >= 64 */
+	int64		flushes;
+	int64		trees;
 } RginBuildInfo;
 
 static RginBuildInfo build_info;
-static int64 widen_events = 0;
+
+typedef struct RginInsertInfo
+{
+	int64		rows;
+	int64		postings;
+	int64		widen;			/* posting-tree entry tuple rewritten */
+	int64		to_tree;		/* posting list converted to a tree */
+} RginInsertInfo;
+
+static RginInsertInfo insert_info;
 
 typedef struct RginStats
 {
 	const char *strategy;
+	const char *decode;
 	int			nterms;
 	int			phases;
 	int64		postings;
+	int64		segments;
 	int64		leaf_pages;
 	int64		descents;
 	int64		seeks;
@@ -302,6 +266,38 @@ typedef struct RginBuildState
 	GinStatsData stats;
 } RginBuildState;
 
+/* move the accumulator contents into the index */
+static void
+rgin_flush(RginBuildState *bs)
+{
+	ItemPointerData *list;
+	char	   *payloads;
+	Datum		key;
+	GinNullCategory category;
+	uint32		nlist;
+	OffsetNumber attnum;
+	MemoryContext oldCtx = MemoryContextSwitchTo(bs->tmpCtx);
+
+	ginBeginBAScan(&bs->accum);
+	while ((list = ginGetBAEntryPayload(&bs->accum, &attnum, &key, &category,
+										&nlist, &payloads)) != NULL)
+	{
+		int			flags;
+
+		CHECK_FOR_INTERRUPTS();
+		flags = ginEntryInsertPayload(&bs->gs, attnum, key, category,
+									  list, payloads, nlist, &bs->stats);
+		bs->npostings += nlist;
+		build_info.terms++;
+		if (flags & GIN_INSERT_TO_TREE)
+			build_info.trees++;
+	}
+	MemoryContextSwitchTo(oldCtx);
+	MemoryContextReset(bs->tmpCtx);
+	ginInitBA(&bs->accum);
+	build_info.flushes++;
+}
+
 static void
 rgin_build_cb(Relation index, ItemPointer tid, Datum *values,
 			  bool *isnull, bool tupleIsAlive, void *state)
@@ -311,7 +307,9 @@ rgin_build_cb(Relation index, ItemPointer tid, Datum *values,
 	TSVector	tsv;
 	WordEntry  *we;
 	int			dl;
-	GinNullCategory cat = GIN_CAT_NORM_KEY;
+	Datum	   *keys;
+	GinNullCategory *cats;
+	char	   *payloads;
 
 	if (isnull[0])
 		return;
@@ -321,24 +319,24 @@ rgin_build_cb(Relation index, ItemPointer tid, Datum *values,
 	bs->N++;
 	bs->sumdl += dl;
 	we = ARRPTR(tsv);
+	keys = palloc(sizeof(Datum) * Max(tsv->size, 1));
+	cats = palloc0(sizeof(GinNullCategory) * Max(tsv->size, 1));
+	payloads = palloc(W * Max(tsv->size, 1));
 	for (int i = 0; i < tsv->size; i++)
 	{
-		Datum		key = PointerGetDatum(cstring_to_text_with_len(STRPTR(tsv) + we[i].pos,
-																   we[i].len));
-		ItemPointerData item = rgin_encode(tid,
-										   rgin_bm25_payload(rgin_tsv_tf(tsv, &we[i]), dl));
-
-		MemoryContextSwitchTo(bs->tmpCtx);
-		ginInsertBAEntries(&bs->accum, &item, FirstOffsetNumber, &key, &cat, 1);
-		MemoryContextSwitchTo(bs->funcCtx);
+		keys[i] = PointerGetDatum(cstring_to_text_with_len(STRPTR(tsv) + we[i].pos,
+														   we[i].len));
+		rgin_payload_put(payloads + i * W,
+						 rgin_bm25_payload(rgin_tsv_tf(tsv, &we[i]), dl));
 	}
+	MemoryContextSwitchTo(bs->tmpCtx);
+	ginInsertBAEntriesPayload(&bs->accum, tid, FirstOffsetNumber, keys, cats,
+							  payloads, tsv->size);
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(bs->funcCtx);
 
 	if (bs->accum.allocatedMemory >= maintenance_work_mem * (Size) 1024)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("rgin research prototype builds in one accumulator pass; raise maintenance_work_mem")));
+		rgin_flush(bs);
 }
 
 static IndexBuildResult *
@@ -348,33 +346,27 @@ rginbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	Buffer		RootBuffer,
 				MetaBuffer;
 	double		reltuples;
-	ItemPointerData *list;
-	Datum		key;
-	GinNullCategory category;
-	uint32		nlist;
-	OffsetNumber attnum;
-	ItemPointerData *fbuf = palloc(sizeof(ItemPointerData) * 257);
 	IndexBuildResult *result;
-	MemoryContext oldCtx;
+	RginIndexMeta im;
 
 	if (RelationGetNumberOfBlocks(index) != 0)
 		elog(ERROR, "index \"%s\" already contains data", RelationGetRelationName(index));
-	if (GinGetUseFastUpdate(index))
+	if (rgin_fastupdate(index))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("rgin research prototype requires fastupdate = off")));
 	if (indexInfo->ii_NumIndexAttrs != 1 || indexInfo->ii_IndexAttrNumbers[0] == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("rgin research prototype supports one plain column")));
+				 errmsg("rgin payload index must have exactly one plain column")));
 
 	memset(&bs, 0, sizeof(bs));
-	initGinState(&bs.gs, index);
+	memset(&build_info, 0, sizeof(build_info));
 
 	MetaBuffer = GinNewBuffer(index);
 	RootBuffer = GinNewBuffer(index);
 	START_CRIT_SECTION();
-	GinInitMetabuffer(MetaBuffer);
+	GinInitMetabufferPayload(MetaBuffer, W);
 	MarkBufferDirty(MetaBuffer);
 	GinInitBuffer(RootBuffer, GIN_LEAF);
 	MarkBufferDirty(RootBuffer);
@@ -383,6 +375,8 @@ rginbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	END_CRIT_SECTION();
 	bs.stats.nEntryPages++;
 
+	rgin_init_state(&bs.gs, index);
+
 	bs.tmpCtx = AllocSetContextCreate(CurrentMemoryContext, "rgin build",
 									  ALLOCSET_DEFAULT_SIZES);
 	bs.funcCtx = AllocSetContextCreate(CurrentMemoryContext, "rgin build tuple",
@@ -390,41 +384,20 @@ rginbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.accum.ginstate = &bs.gs;
 	ginInitBA(&bs.accum);
 
-	/* no sync scan: postings must arrive in TID order */
+	/* no sync scan: postings should arrive in TID order */
 	reltuples = table_index_build_scan(heap, index, indexInfo, false, true,
 									   rgin_build_cb, &bs, NULL);
-
-	memset(&build_info, 0, sizeof(build_info));
-	oldCtx = MemoryContextSwitchTo(bs.tmpCtx);
-	ginBeginBAScan(&bs.accum);
-	while ((list = ginGetBAEntry(&bs.accum, &attnum, &key, &category, &nlist)) != NULL)
-	{
-		CHECK_FOR_INTERRUPTS();
-		ginEntryInsert(&bs.gs, attnum, key, category, list, nlist, &bs.stats);
-		bs.npostings += nlist;
-		build_info.terms++;
-		if (rgin_build_evidence && category == GIN_CAT_NORM_KEY)
-		{
-			char	   *lex = VARDATA_ANY(DatumGetPointer(key));
-			int			len = VARSIZE_ANY_EXHDR(DatumGetPointer(key));
-			int			m = frontier_of(list, nlist, fbuf);
-
-			/* one magic entry per term: frontier points, then the df item */
-			ItemPointerSet(&fbuf[m], RGIN_DF_BLOCK_BASE + nlist, FirstOffsetNumber);
-			insert_magic(&bs.gs, RGIN_TAG_FRONTIER, lex, len, fbuf, m + 1, &bs.stats);
-			build_info.frontier_points += m;
-			build_info.frontier_hist[Min(m, 64)]++;
-		}
-	}
-	MemoryContextSwitchTo(oldCtx);
-	insert_scalar(&bs.gs, "N", bs.N, &bs.stats);
-	insert_scalar(&bs.gs, "S", bs.sumdl, &bs.stats);
-	build_info.N = bs.N;
-	build_info.sumdl = bs.sumdl;
-	build_info.postings = bs.npostings;
+	rgin_flush(&bs);
 
 	MemoryContextDelete(bs.funcCtx);
 	MemoryContextDelete(bs.tmpCtx);
+
+	im.N = bs.N;
+	im.sumdl = bs.sumdl;
+	ginSetIndexStaticMeta(index, (char *) &im, sizeof(im));
+	build_info.N = bs.N;
+	build_info.sumdl = bs.sumdl;
+	build_info.postings = bs.npostings;
 
 	bs.stats.nTotalPages = RelationGetNumberOfBlocks(index);
 	ginUpdateStats(index, &bs.stats, true);
@@ -435,6 +408,36 @@ rginbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	result->heap_tuples = reltuples;
 	result->index_tuples = bs.npostings;
 	return result;
+}
+
+/* like ginbuildempty, with the payload metapage */
+static void
+rginbuildempty(Relation index)
+{
+	Buffer		RootBuffer,
+				MetaBuffer;
+
+	MetaBuffer = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
+								   EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
+	RootBuffer = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
+								   EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
+	START_CRIT_SECTION();
+	GinInitMetabufferPayload(MetaBuffer, W);
+	{
+		GinMetaPageExt *ext = GinPageGetMetaExt(BufferGetPage(MetaBuffer));
+		RginIndexMeta im = {0, 0};
+
+		memcpy(ext->staticMeta, &im, sizeof(im));
+		ext->staticMetaLen = sizeof(im);
+	}
+	MarkBufferDirty(MetaBuffer);
+	log_newpage_buffer(MetaBuffer, true);
+	GinInitBuffer(RootBuffer, GIN_LEAF);
+	MarkBufferDirty(RootBuffer);
+	log_newpage_buffer(RootBuffer, false);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(MetaBuffer);
+	UnlockReleaseBuffer(RootBuffer);
 }
 
 /* ---------------------------------------------------------------- insert (append-only) */
@@ -452,7 +455,7 @@ rgininsert(Relation index, Datum *values, bool *isnull,
 	WordEntry  *we;
 	int			dl;
 
-	if (GinGetUseFastUpdate(index))
+	if (rgin_fastupdate(index))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("rgin research prototype requires fastupdate = off")));
@@ -460,7 +463,7 @@ rgininsert(Relation index, Datum *values, bool *isnull,
 	{
 		old = MemoryContextSwitchTo(indexInfo->ii_Context);
 		gs = palloc_object(GinState);
-		initGinState(gs, index);
+		rgin_init_state(gs, index);
 		indexInfo->ii_AmCache = gs;
 		MemoryContextSwitchTo(old);
 	}
@@ -474,34 +477,22 @@ rgininsert(Relation index, Datum *values, bool *isnull,
 	we = ARRPTR(tsv);
 	for (int i = 0; i < tsv->size; i++)
 	{
-		char	   *lex = STRPTR(tsv) + we[i].pos;
-		RginPayload p = rgin_bm25_payload(rgin_tsv_tf(tsv, &we[i]), dl);
-		ItemPointerData item = rgin_encode(ht_ctid, p);
-		int			n;
-		ItemPointer pts;
-		bool		dominated = false;
+		char		payload[W];
+		int			flags;
 
 		CHECK_FOR_INTERRUPTS();
-		/*
-		 * Widen the root frontier before the posting becomes reachable.  The
-		 * frontier is a set of points; dominated points are never removed
-		 * (append-only), which keeps the bound safe.
-		 */
-		pts = rgin_read_magic(index, gs, RGIN_TAG_FRONTIER, lex, we[i].len, &n);
-		for (int j = 0; pts && j < n && !dominated; j++)
-			dominated = RGIN_IS_POINT(&pts[j]) &&
-				rgin_payload_dominates(rgin_item_to_point(&pts[j]), p);
-		if (!dominated)
-		{
-			ItemPointerData pi = rgin_point_to_item(p);
-
-			insert_magic(gs, RGIN_TAG_FRONTIER, lex, we[i].len, &pi, 1, NULL);
-			widen_events++;
-		}
-		ginEntryInsert(gs, FirstOffsetNumber,
-					   PointerGetDatum(cstring_to_text_with_len(lex, we[i].len)),
-					   GIN_CAT_NORM_KEY, &item, 1, NULL);
+		rgin_payload_put(payload, rgin_bm25_payload(rgin_tsv_tf(tsv, &we[i]), dl));
+		flags = ginEntryInsertPayload(gs, FirstOffsetNumber,
+									  PointerGetDatum(cstring_to_text_with_len(STRPTR(tsv) + we[i].pos,
+																			   we[i].len)),
+									  GIN_CAT_NORM_KEY, ht_ctid, payload, 1, NULL);
+		insert_info.postings++;
+		if (flags & GIN_INSERT_META_WIDENED)
+			insert_info.widen++;
+		if (flags & GIN_INSERT_TO_TREE)
+			insert_info.to_tree++;
 	}
+	insert_info.rows++;
 	MemoryContextSwitchTo(old);
 	MemoryContextDelete(ctx);
 	return false;
@@ -511,6 +502,11 @@ static IndexBulkDeleteResult *
 rginbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			   IndexBulkDeleteCallback callback, void *callback_state)
 {
+	/*
+	 * Temporary development guard.  The format removes a payload together
+	 * with its posting, but posting-tree and entry vacuum are not yet made
+	 * payload- and metadata-aware (ginvacuum.c would drop entry metadata).
+	 */
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("rgin research prototype is append-only: bulk delete is not supported")));
@@ -523,19 +519,25 @@ typedef struct RginCursor
 {
 	bool		done;
 	bool		isTree;
-	GinBtreeData btree;
-	Buffer		buf;			/* pinned, unlocked */
+	GinBtreeData btree;			/* for descents in the posting tree */
+	Buffer		buf;			/* current leaf, pinned, unlocked */
+	bool		rightmost;
+	uint64		rbound;			/* key of the page's right bound */
+	/* decoded unit: items[pos .. nitems) */
 	ItemPointer items;
+	char	   *payloads;
 	int			nitems;
 	int			pos;
-	bool		rightmost;
-	uint64		rbound;
+	/* segment mode: private copy of the leaf, next segment to decode */
+	char	   *page;
+	GinPostingList *seg;
+	char	   *segend;
 } RginCursor;
 
 typedef struct PoolEntry
 {
 	double		score;
-	uint64		rk;
+	uint64		key;
 } PoolEntry;
 
 typedef struct RginScanOpaqueData
@@ -545,6 +547,7 @@ typedef struct RginScanOpaqueData
 	RginQuery  *q;
 	bool		empty;
 	int			strategy;
+	int			decode;
 	double	   *ub;
 	int		   *order;
 	int			phases_done;
@@ -563,49 +566,103 @@ typedef struct RginScanOpaqueData
 typedef RginScanOpaqueData *RginScanOpaque;
 
 static void
-cursor_load(RginScanOpaque so, RginCursor *c, Page page, ItemPointerData adv)
+cursor_set_items(RginCursor *c, ItemPointer items, char *payloads, int n)
 {
 	if (c->items)
 		pfree(c->items);
-	c->items = GinDataLeafPageGetItems(page, &c->nitems, adv);
-	c->rightmost = GinPageRightMost(page);
-	c->rbound = c->rightmost ? PG_UINT64_MAX : ip_u64(GinDataPageGetRightBound(page));
+	if (c->payloads)
+		pfree(c->payloads);
+	c->items = items;
+	c->payloads = payloads;
+	c->nitems = n;
 	c->pos = 0;
-	so->st.postings += c->nitems;
+}
+
+/* segment mode: decode the next segment of the page copy, if any */
+static bool
+cursor_next_segment(RginScanOpaque so, RginCursor *c)
+{
+	ItemPointer items;
+	char	   *payloads;
+	int			n;
+
+	if (c->seg == NULL)
+		return false;
+	items = ginPostingListDecodePayload(c->seg, W, &n, &payloads);
+	cursor_set_items(c, items, payloads, n);
+	so->st.postings += n;
+	so->st.segments++;
+	c->seg = GinNextPostingListSegment(c->seg);
+	if ((char *) c->seg >= c->segend)
+		c->seg = NULL;
+	return true;
+}
+
+/* load a leaf page (locked by the caller), skipping items <= adv */
+static void
+cursor_load(RginScanOpaque so, RginCursor *c, Page page, ItemPointerData adv)
+{
+	c->rightmost = GinPageRightMost(page);
+	c->rbound = c->rightmost ? PG_UINT64_MAX : tid_key(GinDataPageGetRightBound(page));
 	so->st.leaf_pages++;
+	if (so->decode == RGIN_DECODE_PAGE)
+	{
+		ItemPointer items;
+		char	   *payloads;
+		int			n;
+		char	   *endptr;
+		GinPostingList *seg = GinDataLeafPageFindSegment(page, adv, &endptr);
+
+		items = GinDataLeafPageGetItemsPayload(page, W, &n, adv, &payloads);
+		cursor_set_items(c, items, payloads, n);
+		so->st.postings += n;
+		for (; seg && (char *) seg < endptr; seg = GinNextPostingListSegment(seg))
+			so->st.segments++;
+	}
+	else
+	{
+		if (c->page == NULL)
+			c->page = palloc(BLCKSZ);
+		memcpy(c->page, page, BLCKSZ);
+		c->seg = GinDataLeafPageFindSegment(c->page, adv, &c->segend);
+		cursor_set_items(c, NULL, NULL, 0);
+		(void) cursor_next_segment(so, c);
+	}
 }
 
 static void
 cursor_open(Relation index, RginScanOpaque so, RginCursor *c, int term)
 {
 	RginQuery  *q = so->q;
-	BlockNumber root;
-	Datum		key = PointerGetDatum(cstring_to_text_with_len(RGIN_QUERY_LEXEME(q, term),
-															   q->terms[term].len));
+	RginTermInfo ti;
 
 	memset(c, 0, sizeof(*c));
 	c->buf = InvalidBuffer;
-	if (!lookup_entry(index, &so->gs, key, &root, &c->items, &c->nitems))
+	rgin_lookup_term(index, &so->gs, RGIN_QUERY_LEXEME(q, term), q->terms[term].len,
+					 true, &ti);
+	if (!ti.found)
 	{
 		c->done = true;
 		return;
 	}
-	if (root == InvalidBlockNumber)
+	if (!ti.isTree)
 	{
+		c->items = ti.items;
+		c->payloads = ti.payloads;
+		c->nitems = ti.nitems;
 		so->st.postings += c->nitems;
 		c->rightmost = true;
 		c->done = (c->nitems == 0);
-		return;
 	}
 	else
 	{
-		GinBtreeStack *stack = ginScanBeginPostingTree(&c->btree, index, root);
+		GinBtreeStack *stack = ginScanBeginPostingTree(&c->btree, index, ti.root);
 		ItemPointerData minItem;
 
 		c->isTree = true;
 		c->buf = stack->buffer;
 		IncrBufferRefCount(c->buf);
-		ItemPointerSetMin(&minItem);
+		ItemPointerSetInvalid(&minItem);
 		cursor_load(so, c, BufferGetPage(c->buf), minItem);
 		LockBuffer(c->buf, GIN_UNLOCK);
 		freeGinBtreeStack(stack);
@@ -618,20 +675,21 @@ cursor_close(RginCursor *c)
 	if (BufferIsValid(c->buf))
 		ReleaseBuffer(c->buf);
 	c->buf = InvalidBuffer;
-	if (c->items)
-		pfree(c->items);
-	c->items = NULL;
+	cursor_set_items(c, NULL, NULL, 0);
+	if (c->page)
+		pfree(c->page);
+	c->page = NULL;
+	c->seg = NULL;
 	c->done = true;
 }
 
-/* position on the first posting with heap row key >= target */
+/* position on the first posting with TID key >= target */
 static bool
 cursor_seek(Relation index, RginScanOpaque so, RginCursor *c, uint64 target)
 {
 	so->st.seeks++;
 	for (;;)
 	{
-		uint64		lb;
 		ItemPointerData adv;
 
 		if (c->done)
@@ -639,14 +697,14 @@ cursor_seek(Relation index, RginScanOpaque so, RginCursor *c, uint64 target)
 		if (c->pos < c->nitems)
 		{
 			/* sequential access: the next posting usually qualifies */
-			if (rgin_rk(&c->items[c->pos]) >= target)
+			if (tid_key(&c->items[c->pos]) >= target)
 				return true;
-			if (c->pos + 1 < c->nitems && rgin_rk(&c->items[c->pos + 1]) >= target)
+			if (c->pos + 1 < c->nitems && tid_key(&c->items[c->pos + 1]) >= target)
 			{
 				c->pos++;
 				return true;
 			}
-			if (rgin_rk(&c->items[c->nitems - 1]) >= target)
+			if (tid_key(&c->items[c->nitems - 1]) >= target)
 			{
 				int			lo = c->pos,
 							hi = c->nitems - 1;
@@ -655,7 +713,7 @@ cursor_seek(Relation index, RginScanOpaque so, RginCursor *c, uint64 target)
 				{
 					int			mid = (lo + hi) / 2;
 
-					if (rgin_rk(&c->items[mid]) >= target)
+					if (tid_key(&c->items[mid]) >= target)
 						hi = mid;
 					else
 						lo = mid + 1;
@@ -665,27 +723,32 @@ cursor_seek(Relation index, RginScanOpaque so, RginCursor *c, uint64 target)
 			}
 			c->pos = c->nitems;
 		}
+		if (c->seg != NULL)
+		{
+			/* segment mode: skip segments wholly below target by header */
+			GinPostingList *next = GinNextPostingListSegment(c->seg);
+
+			while ((char *) next < c->segend && tid_key(&next->first) <= target)
+			{
+				c->seg = next;
+				next = GinNextPostingListSegment(c->seg);
+			}
+			(void) cursor_next_segment(so, c);
+			continue;
+		}
 		if (!c->isTree || c->rightmost)
 		{
 			cursor_close(c);
 			return false;
 		}
-		lb = (target << 17) | 1;
-		/*
-		 * Items > adv are exactly those with heap row key >= target.  adv
-		 * must be a valid item pointer (odd value), or GIN skips nothing.
-		 */
-		if (lb >= 3)
-			adv = u64_ip(lb - 2);
-		else
-			ItemPointerSetMin(&adv);
-		if (c->rbound < lb)
+		adv = advance_past(target);
+		if (c->rbound < target)
 		{
 			GinBtreeStack *stack;
 
 			ReleaseBuffer(c->buf);
 			c->btree.fullScan = false;
-			c->btree.itemptr = u64_ip(lb);
+			key_to_tid(target, &c->btree.itemptr);
 			stack = ginFindLeafPage(&c->btree, true, false);
 			c->buf = stack->buffer;
 			IncrBufferRefCount(c->buf);
@@ -704,10 +767,16 @@ cursor_seek(Relation index, RginScanOpaque so, RginCursor *c, uint64 target)
 	}
 }
 
-static inline ItemPointer
-cursor_item(RginCursor *c)
+static inline uint64
+cursor_key(RginCursor *c)
 {
-	return &c->items[c->pos];
+	return tid_key(&c->items[c->pos]);
+}
+
+static inline RginPayload
+cursor_payload(RginCursor *c)
+{
+	return rgin_payload_get(c->payloads + c->pos * W);
 }
 
 /* ---------------------------------------------------------------- pool */
@@ -715,11 +784,11 @@ cursor_item(RginCursor *c)
 static inline bool
 better(const PoolEntry *a, const PoolEntry *b)
 {
-	return a->score > b->score || (a->score == b->score && a->rk < b->rk);
+	return a->score > b->score || (a->score == b->score && a->key < b->key);
 }
 
 static void
-pool_push(RginScanOpaque so, double score, uint64 rk)
+pool_push(RginScanOpaque so, double score, uint64 key)
 {
 	int64		i;
 
@@ -731,7 +800,7 @@ pool_push(RginScanOpaque so, double score, uint64 rk)
 	}
 	i = so->npool++;
 	so->pool[i].score = score;
-	so->pool[i].rk = rk;
+	so->pool[i].key = key;
 	while (i > 0)
 	{
 		int64		p = (i - 1) / 2;
@@ -810,7 +879,6 @@ run_full(IndexScanDesc scan)
 	RginCursor *cur = palloc0(sizeof(RginCursor) * nt);
 	bool	   *valid = palloc(sizeof(bool) * nt);
 	int64		cap = 1024;
-
 	instr_time	t0,
 				t1;
 
@@ -829,17 +897,16 @@ run_full(IndexScanDesc scan)
 		CHECK_FOR_INTERRUPTS();
 		for (int i = 0; i < nt; i++)
 			if (valid[i])
-				d = Min(d, rgin_rk(cursor_item(&cur[i])));
+				d = Min(d, cursor_key(&cur[i]));
 		if (d == PG_UINT64_MAX)
 			break;
 		for (int i = 0; i < nt; i++)
 		{
 			so->has[i] = false;
-			if (valid[i] && rgin_rk(cursor_item(&cur[i])) == d)
+			if (valid[i] && cursor_key(&cur[i]) == d)
 			{
 				so->has[i] = true;
-				so->contrib[i] = rgin_contrib(rgin_payload(cursor_item(&cur[i])),
-											  q->terms[i].idf, q);
+				so->contrib[i] = rgin_contrib(cursor_payload(&cur[i]), q->terms[i].idf, q);
 				so->st.contribs++;
 				valid[i] = cursor_seek(scan->indexRelation, so, &cur[i], d + 1);
 			}
@@ -850,7 +917,7 @@ run_full(IndexScanDesc scan)
 			so->full = repalloc_huge(so->full, sizeof(PoolEntry) * cap);
 		}
 		so->full[so->nfull].score = sum_score(so);
-		so->full[so->nfull].rk = d;
+		so->full[so->nfull].key = d;
 		so->nfull++;
 	}
 	for (int i = 0; i < nt; i++)
@@ -895,8 +962,7 @@ run_phase(IndexScanDesc scan)
 
 	for (valid = cursor_seek(index, so, &cur[T], 0); valid;)
 	{
-		ItemPointer it = cursor_item(&cur[T]);
-		uint64		d = rgin_rk(it);
+		uint64		d = cursor_key(&cur[T]);
 		bool		seen = false;
 
 		CHECK_FOR_INTERRUPTS();
@@ -905,7 +971,7 @@ run_phase(IndexScanDesc scan)
 		{
 			RginCursor *c = &cur[so->order[e]];
 
-			if (cursor_seek(index, so, c, d) && rgin_rk(cursor_item(c)) == d)
+			if (cursor_seek(index, so, c, d) && cursor_key(c) == d)
 				seen = true;
 		}
 		if (!seen)
@@ -913,18 +979,17 @@ run_phase(IndexScanDesc scan)
 			for (int i = 0; i < nt; i++)
 				so->has[i] = false;
 			so->has[T] = true;
-			so->contrib[T] = rgin_contrib(rgin_payload(it), q->terms[T].idf, q);
+			so->contrib[T] = rgin_contrib(cursor_payload(&cur[T]), q->terms[T].idf, q);
 			so->st.contribs++;
 			for (int l = j + 1; l < nt; l++)
 			{
 				int			t = so->order[l];
 				RginCursor *c = &cur[t];
 
-				if (cursor_seek(index, so, c, d) && rgin_rk(cursor_item(c)) == d)
+				if (cursor_seek(index, so, c, d) && cursor_key(c) == d)
 				{
 					so->has[t] = true;
-					so->contrib[t] = rgin_contrib(rgin_payload(cursor_item(c)),
-												  q->terms[t].idf, q);
+					so->contrib[t] = rgin_contrib(cursor_payload(c), q->terms[t].idf, q);
 					so->st.contribs++;
 				}
 			}
@@ -988,7 +1053,7 @@ rginbeginscan(Relation index, int nkeys, int norderbys)
 
 	so->ctx = AllocSetContextCreate(CurrentMemoryContext, "rgin scan",
 									ALLOCSET_DEFAULT_SIZES);
-	initGinState(&so->gs, index);
+	rgin_init_state(&so->gs, index);
 	scan->opaque = so;
 	if (norderbys > 0)
 	{
@@ -1009,6 +1074,43 @@ same_terms(RginQuery *a, RginQuery *b)
 			memcmp(RGIN_QUERY_LEXEME(a, i), RGIN_QUERY_LEXEME(b, i), a->terms[i].len) != 0)
 			return false;
 	return true;
+}
+
+/*
+ * Root bound of one term: frontier maximum for a posting-tree key, exact
+ * maximum over the inline postings otherwise.
+ */
+static double
+term_bound(RginScanOpaque so, Relation index, int i)
+{
+	RginQuery  *q = so->q;
+	RginTermInfo ti;
+	double		ub = 0.0;
+
+	rgin_lookup_term(index, &so->gs, RGIN_QUERY_LEXEME(q, i), q->terms[i].len,
+					 true, &ti);
+	if (!ti.found)
+		return 0.0;
+	if (ti.isTree)
+	{
+		if (ti.meta.npoints == 0)
+			return q->terms[i].idf * (q->k1 + 1.0);	/* weakest safe bound */
+		for (int j = 0; j < ti.meta.npoints; j++)
+		{
+			ub = Max(ub, rgin_contrib(ti.meta.points[j], q->terms[i].idf, q));
+			so->st.bound_evals++;
+		}
+	}
+	else
+	{
+		for (int j = 0; j < ti.nitems; j++)
+		{
+			ub = Max(ub, rgin_contrib(rgin_payload_get(ti.payloads + j * W),
+									  q->terms[i].idf, q));
+			so->st.bound_evals++;
+		}
+	}
+	return ub;
 }
 
 static void
@@ -1062,34 +1164,17 @@ rginrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	so->strategy = rgin_strategy;
 	if (so->strategy == RGIN_STRATEGY_AUTO)
 		so->strategy = (q->nterms <= 2) ? RGIN_STRATEGY_C : RGIN_STRATEGY_FULL;
+	so->decode = rgin_decode;
 	so->st.strategy = so->strategy == RGIN_STRATEGY_C ? "c" : "full";
+	so->st.decode = so->decode == RGIN_DECODE_PAGE ? "page" : "segment";
 	so->st.nterms = q->nterms;
 
-	/* root bounds from the stored frontier (C only) */
 	if (so->strategy == RGIN_STRATEGY_C)
 	{
 		for (int i = 0; i < q->nterms; i++)
 		{
-			int			n;
-			ItemPointer pts = rgin_read_magic(scan->indexRelation, &so->gs, RGIN_TAG_FRONTIER,
-											  RGIN_QUERY_LEXEME(q, i), q->terms[i].len, &n);
-
 			so->order[i] = i;
-			if (pts == NULL)
-			{
-				/* no stored frontier: weakest safe bound, contrib <= idf*(k1+1) */
-				so->ub[i] = q->terms[i].idf * (q->k1 + 1.0);
-				continue;
-			}
-			so->ub[i] = 0.0;
-			for (int j = 0; j < n; j++)
-			{
-				if (!RGIN_IS_POINT(&pts[j]))
-					continue;
-				so->ub[i] = Max(so->ub[i], rgin_contrib(rgin_item_to_point(&pts[j]),
-														q->terms[i].idf, q));
-				so->st.bound_evals++;
-			}
+			so->ub[i] = term_bound(so, scan->indexRelation, i);
 		}
 		qsort_arg(so->order, q->nterms, sizeof(int), order_cmp_arg, so->ub);
 		so->D = 0.0;
@@ -1113,12 +1198,16 @@ verify_emit(IndexScanDesc scan, double score)
 	if (heap == NULL)
 		return;
 	tup.t_self = scan->xs_heaptid;
-	if (!heap_fetch(heap, SnapshotAny, &tup, &buf, true))
+	if (!heap_fetch(heap, scan->xs_snapshot, &tup, &buf, true))
 	{
+		/*
+		 * Not visible to the scan, e.g. an aborted insert whose index entries
+		 * may be partial after a crash.  The executor does not return it, so
+		 * there is nothing to verify.
+		 */
 		if (BufferIsValid(buf))
 			ReleaseBuffer(buf);
-		elog(ERROR, "rgin verify: heap tuple (%u,%u) not found",
-			 ItemPointerGetBlockNumber(&tup.t_self), ItemPointerGetOffsetNumber(&tup.t_self));
+		return;
 	}
 	d = heap_getattr(&tup, scan->indexRelation->rd_index->indkey.values[0],
 					 RelationGetDescr(heap), &isnull);
@@ -1135,7 +1224,7 @@ emit(IndexScanDesc scan, PoolEntry e)
 {
 	RginScanOpaque so = (RginScanOpaque) scan->opaque;
 
-	rk_to_tid(e.rk, &scan->xs_heaptid);
+	key_to_tid(e.key, &scan->xs_heaptid);
 	scan->xs_recheck = false;
 	scan->xs_recheckorderby = false;
 	scan->xs_orderbyvals[0] = Float8GetDatum(-e.score);
@@ -1238,14 +1327,9 @@ rginvalidate(Oid opclassoid)
 	return true;
 }
 
-/* ---------------------------------------------------------------- handler, SQL API */
+/* ---------------------------------------------------------------- handler */
 
 PG_FUNCTION_INFO_V1(rgin_handler);
-PG_FUNCTION_INFO_V1(rgin_last_stats);
-PG_FUNCTION_INFO_V1(rgin_build_info);
-PG_FUNCTION_INFO_V1(rgin_widen_events);
-PG_FUNCTION_INFO_V1(rgin_term_frontier);
-PG_FUNCTION_INFO_V1(rgin_term_frontier_points);
 
 Datum
 rgin_handler(PG_FUNCTION_ARGS)
@@ -1278,7 +1362,7 @@ rgin_handler(PG_FUNCTION_ARGS)
 		.amkeytype = InvalidOid,
 
 		.ambuild = rginbuild,
-		.ambuildempty = ginbuildempty,
+		.ambuildempty = rginbuildempty,
 		.aminsert = rgininsert,
 		.aminsertcleanup = NULL,
 		.ambulkdelete = rginbulkdelete,
@@ -1312,6 +1396,15 @@ rgin_is_rgin_index(Relation index)
 	return index->rd_indam && index->rd_indam->amgettuple == rgingettuple;
 }
 
+/* ---------------------------------------------------------------- SQL inspection */
+
+PG_FUNCTION_INFO_V1(rgin_last_stats);
+PG_FUNCTION_INFO_V1(rgin_build_info);
+PG_FUNCTION_INFO_V1(rgin_insert_info);
+PG_FUNCTION_INFO_V1(rgin_term_meta);
+PG_FUNCTION_INFO_V1(rgin_term_frontier_points);
+PG_FUNCTION_INFO_V1(rgin_check);
+
 Datum
 rgin_last_stats(PG_FUNCTION_ARGS)
 {
@@ -1322,16 +1415,18 @@ rgin_last_stats(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	initStringInfo(&s);
 	appendStringInfo(&s,
-					 "{\"strategy\":\"%s\",\"nterms\":%d,\"phases\":%d,"
-					 "\"postings_decoded\":" INT64_FORMAT ",\"leaf_pages\":" INT64_FORMAT
+					 "{\"strategy\":\"%s\",\"decode\":\"%s\",\"nterms\":%d,\"phases\":%d,"
+					 "\"postings_decoded\":" INT64_FORMAT ",\"segments_decoded\":" INT64_FORMAT
+					 ",\"leaf_pages\":" INT64_FORMAT
 					 ",\"descents\":" INT64_FORMAT ",\"seeks\":" INT64_FORMAT
 					 ",\"docs_scored\":" INT64_FORMAT ",\"contribs\":" INT64_FORMAT
 					 ",\"bound_evals\":" INT64_FORMAT ",\"pool_peak\":" INT64_FORMAT
 					 ",\"pool_peak_bytes\":" INT64_FORMAT ",\"emitted\":" INT64_FORMAT
 					 ",\"fallback\":%s,\"full_docs\":" INT64_FORMAT
 					 ",\"full_merge_ms\":%.3f,\"full_sort_ms\":%.3f,\"phase_ms\":%.3f}",
-					 st->strategy ? st->strategy : "", st->nterms, st->phases,
-					 st->postings, st->leaf_pages, st->descents, st->seeks,
+					 st->strategy ? st->strategy : "", st->decode ? st->decode : "",
+					 st->nterms, st->phases,
+					 st->postings, st->segments, st->leaf_pages, st->descents, st->seeks,
 					 st->docs_scored, st->contribs, st->bound_evals, st->pool_peak,
 					 st->pool_peak_bytes, st->emitted, st->fallback ? "true" : "false",
 					 st->full_docs, st->full_merge_ms, st->full_sort_ms, st->phase_ms);
@@ -1346,73 +1441,299 @@ rgin_build_info(PG_FUNCTION_ARGS)
 	initStringInfo(&s);
 	appendStringInfo(&s, "{\"N\":" INT64_FORMAT ",\"sumdl\":" INT64_FORMAT
 					 ",\"terms\":" INT64_FORMAT ",\"postings\":" INT64_FORMAT
-					 ",\"frontier_points\":" INT64_FORMAT ",\"hist\":[",
+					 ",\"flushes\":" INT64_FORMAT ",\"trees\":" INT64_FORMAT "}",
 					 build_info.N, build_info.sumdl, build_info.terms,
-					 build_info.postings, build_info.frontier_points);
-	for (int i = 0; i <= 64; i++)
-		appendStringInfo(&s, "%s" INT64_FORMAT, i ? "," : "", build_info.frontier_hist[i]);
-	appendStringInfoString(&s, "]}");
+					 build_info.postings, build_info.flushes, build_info.trees);
 	PG_RETURN_TEXT_P(cstring_to_text(s.data));
 }
 
 Datum
-rgin_widen_events(PG_FUNCTION_ARGS)
+rgin_insert_info(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT64(widen_events);
+	StringInfoData s;
+
+	initStringInfo(&s);
+	appendStringInfo(&s, "{\"rows\":" INT64_FORMAT ",\"postings\":" INT64_FORMAT
+					 ",\"widen\":" INT64_FORMAT ",\"to_tree\":" INT64_FORMAT "}",
+					 insert_info.rows, insert_info.postings, insert_info.widen,
+					 insert_info.to_tree);
+	PG_RETURN_TEXT_P(cstring_to_text(s.data));
 }
 
-/* number of stored root-frontier points of a term (-1 if none) */
-Datum
-rgin_term_frontier(PG_FUNCTION_ARGS)
+static Relation
+open_rgin(Oid indexoid, GinState *gs)
 {
-	Oid			indexoid = PG_GETARG_OID(0);
-	text	   *lex = PG_GETARG_TEXT_PP(1);
 	Relation	index = index_open(indexoid, AccessShareLock);
-	GinState	gs;
-	int			n;
-	ItemPointer pts;
 
 	if (!rgin_is_rgin_index(index))
-		elog(ERROR, "not an rgin index");
-	initGinState(&gs, index);
-	pts = rgin_read_magic(index, &gs, RGIN_TAG_FRONTIER, VARDATA_ANY(lex),
-						  VARSIZE_ANY_EXHDR(lex), &n);
-	index_close(index, NoLock);
-	if (pts == NULL)
-		PG_RETURN_INT32(-1);
-	{
-		int			m = 0;
-
-		for (int j = 0; j < n; j++)
-			m += RGIN_IS_POINT(&pts[j]);
-		PG_RETURN_INT32(m);
-	}
+		elog(ERROR, "\"%s\" is not an rgin index", RelationGetRelationName(index));
+	rgin_init_state(gs, index);
+	return index;
 }
 
-/* stored root-frontier points of a term as tf_byte*256 + norm_code */
+/* entry metadata of a key, as JSON (NULL if the key is absent) */
+Datum
+rgin_term_meta(PG_FUNCTION_ARGS)
+{
+	text	   *lex = PG_GETARG_TEXT_PP(1);
+	GinState	gs;
+	Relation	index = open_rgin(PG_GETARG_OID(0), &gs);
+	RginTermInfo ti;
+	StringInfoData s;
+
+	rgin_lookup_term(index, &gs, VARDATA_ANY(lex), VARSIZE_ANY_EXHDR(lex), false, &ti);
+	index_close(index, NoLock);
+	if (!ti.found)
+		PG_RETURN_NULL();
+	initStringInfo(&s);
+	appendStringInfo(&s, "{\"tree\":%s,\"nposting_inline\":%d,\"metalen\":%d,"
+					 "\"has_static\":%s,\"df\":" INT64_FORMAT ",\"npoints\":%d}",
+					 ti.isTree ? "true" : "false", ti.nitems, ti.metalen,
+					 ti.meta.has_static ? "true" : "false", ti.meta.df, ti.meta.npoints);
+	PG_RETURN_TEXT_P(cstring_to_text(s.data));
+}
+
+/* stored root-frontier points of a key as tf_byte*256 + norm_code */
 Datum
 rgin_term_frontier_points(PG_FUNCTION_ARGS)
 {
-	Oid			indexoid = PG_GETARG_OID(0);
 	text	   *lex = PG_GETARG_TEXT_PP(1);
-	Relation	index = index_open(indexoid, AccessShareLock);
 	GinState	gs;
-	int			n,
-				m = 0;
-	ItemPointer pts;
+	Relation	index = open_rgin(PG_GETARG_OID(0), &gs);
+	RginTermInfo ti;
 	Datum	   *d;
 
-	if (!rgin_is_rgin_index(index))
-		elog(ERROR, "not an rgin index");
-	initGinState(&gs, index);
-	pts = rgin_read_magic(index, &gs, RGIN_TAG_FRONTIER, VARDATA_ANY(lex),
-						  VARSIZE_ANY_EXHDR(lex), &n);
+	rgin_lookup_term(index, &gs, VARDATA_ANY(lex), VARSIZE_ANY_EXHDR(lex), false, &ti);
 	index_close(index, NoLock);
-	d = palloc(sizeof(Datum) * Max(n, 1));
-	for (int j = 0; pts && j < n; j++)
-		if (RGIN_IS_POINT(&pts[j]))
-			d[m++] = Int32GetDatum((int32) rgin_item_to_point(&pts[j]));
-	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(d, m, INT4OID));
+	d = palloc(sizeof(Datum) * Max(ti.meta.npoints, 1));
+	for (int j = 0; j < ti.meta.npoints; j++)
+		d[j] = Int32GetDatum((int32) ti.meta.points[j]);
+	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(d, ti.meta.npoints, INT4OID));
+}
+
+/*
+ * rgin_check(index): walk the whole index and verify the format invariants:
+ *	- interior entry tuples carry no metadata flag;
+ *	- postings are in strictly increasing TID order within each key;
+ *	- every payload of a posting-tree key is dominated by its root frontier;
+ *	- metadata parses.
+ * Returns counters and the number of violations as JSON.
+ */
+typedef struct CheckCounters
+{
+	int64		entry_pages;
+	int64		interior_tuples;
+	int64		interior_with_meta;
+	int64		leaf_tuples;
+	int64		tree_keys;
+	int64		inline_keys;
+	int64		keys_with_static;
+	int64		meta_bytes;
+	int64		frontier_points;
+	int64		postings;
+	int64		data_leaf_pages;
+	int64		segments;
+	int64		order_violations;
+	int64		bound_violations;
+	int64		tree_without_frontier;
+} CheckCounters;
+
+static bool
+covered(const RginMeta *m, RginPayload p)
+{
+	for (int i = 0; i < m->npoints; i++)
+		if (rgin_payload_dominates(m->points[i], p))
+			return true;
+	return false;
+}
+
+static void
+check_tree(Relation index, BlockNumber root, const RginMeta *m, CheckCounters *cc)
+{
+	Buffer		buf = ReadBuffer(index, root);
+	uint64		prev = 0;
+	bool		first = true;
+
+	LockBuffer(buf, GIN_SHARE);
+	/* descend to the leftmost leaf */
+	while (!GinPageIsLeaf(BufferGetPage(buf)))
+	{
+		Page		page = BufferGetPage(buf);
+		BlockNumber child = PostingItemGetBlockNumber(GinDataPageGetPostingItem(page, FirstOffsetNumber));
+
+		UnlockReleaseBuffer(buf);
+		buf = ReadBuffer(index, child);
+		LockBuffer(buf, GIN_SHARE);
+	}
+	for (;;)
+	{
+		Page		page = BufferGetPage(buf);
+		char	   *endptr;
+		ItemPointerData inv;
+		GinPostingList *seg;
+		BlockNumber next;
+
+		ItemPointerSetInvalid(&inv);
+		seg = GinDataLeafPageFindSegment(page, inv, &endptr);
+		cc->data_leaf_pages++;
+		for (; seg && (char *) seg < endptr; seg = GinNextPostingListSegment(seg))
+		{
+			int			n;
+			char	   *pl;
+			ItemPointer items = ginPostingListDecodePayload(seg, W, &n, &pl);
+
+			cc->segments++;
+			for (int i = 0; i < n; i++)
+			{
+				uint64		k = tid_key(&items[i]);
+
+				if (!first && k <= prev)
+					cc->order_violations++;
+				first = false;
+				prev = k;
+				if (!covered(m, rgin_payload_get(pl + i * W)))
+					cc->bound_violations++;
+			}
+			cc->postings += n;
+			pfree(items);
+			pfree(pl);
+		}
+		next = GinPageGetOpaque(page)->rightlink;
+		UnlockReleaseBuffer(buf);
+		if (next == InvalidBlockNumber)
+			break;
+		buf = ReadBuffer(index, next);
+		LockBuffer(buf, GIN_SHARE);
+	}
+}
+
+Datum
+rgin_check(PG_FUNCTION_ARGS)
+{
+	GinState	gs;
+	Relation	index = open_rgin(PG_GETARG_OID(0), &gs);
+	CheckCounters cc;
+	BlockNumber levelStart = GIN_ROOT_BLKNO;
+	StringInfoData s;
+
+	memset(&cc, 0, sizeof(cc));
+	for (;;)
+	{
+		BlockNumber blk = levelStart;
+		BlockNumber firstChild = InvalidBlockNumber;
+		bool		leafLevel = false;
+
+		while (blk != InvalidBlockNumber)
+		{
+			Buffer		buf = ReadBuffer(index, blk);
+			Page		page;
+			OffsetNumber maxoff;
+
+			LockBuffer(buf, GIN_SHARE);
+			page = BufferGetPage(buf);
+			maxoff = PageGetMaxOffsetNumber(page);
+			leafLevel = GinPageIsLeaf(page);
+			cc.entry_pages++;
+			for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+			{
+				IndexTuple	itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, off));
+
+				if (!leafLevel)
+				{
+					cc.interior_tuples++;
+					if (GinItupHasMeta(itup))
+						cc.interior_with_meta++;
+					if (off == FirstOffsetNumber && firstChild == InvalidBlockNumber)
+						firstChild = GinGetDownlink(itup);
+				}
+				else
+				{
+					int			metalen;
+					char	   *meta = GinItupGetMeta(itup, &metalen);
+					RginMeta	m;
+
+					rgin_meta_parse(meta, metalen, &m);
+					cc.leaf_tuples++;
+					cc.meta_bytes += metalen;
+					cc.frontier_points += m.npoints;
+					if (m.has_static)
+						cc.keys_with_static++;
+					if (GinIsPostingTree(itup))
+					{
+						cc.tree_keys++;
+						if (m.npoints == 0)
+							cc.tree_without_frontier++;
+						check_tree(index, GinGetPostingTree(itup), &m, &cc);
+					}
+					else
+					{
+						int			n;
+						char	   *pl;
+						ItemPointer items;
+
+						cc.inline_keys++;
+						items = ginReadTuplePayload(&gs, FirstOffsetNumber, itup, &n, &pl);
+						for (int i = 1; i < n; i++)
+							if (tid_key(&items[i]) <= tid_key(&items[i - 1]))
+								cc.order_violations++;
+						cc.postings += n;
+					}
+				}
+			}
+			blk = GinPageGetOpaque(page)->rightlink;
+			UnlockReleaseBuffer(buf);
+		}
+		if (leafLevel || firstChild == InvalidBlockNumber)
+			break;
+		levelStart = firstChild;
+	}
+	index_close(index, NoLock);
+
+	initStringInfo(&s);
+	appendStringInfo(&s,
+					 "{\"entry_pages\":" INT64_FORMAT ",\"interior_tuples\":" INT64_FORMAT
+					 ",\"interior_with_meta\":" INT64_FORMAT ",\"leaf_tuples\":" INT64_FORMAT
+					 ",\"tree_keys\":" INT64_FORMAT ",\"inline_keys\":" INT64_FORMAT
+					 ",\"keys_with_static\":" INT64_FORMAT ",\"meta_bytes\":" INT64_FORMAT
+					 ",\"frontier_points\":" INT64_FORMAT ",\"postings\":" INT64_FORMAT
+					 ",\"data_leaf_pages\":" INT64_FORMAT ",\"segments\":" INT64_FORMAT
+					 ",\"order_violations\":" INT64_FORMAT ",\"bound_violations\":" INT64_FORMAT
+					 ",\"tree_without_frontier\":" INT64_FORMAT "}",
+					 cc.entry_pages, cc.interior_tuples, cc.interior_with_meta,
+					 cc.leaf_tuples, cc.tree_keys, cc.inline_keys, cc.keys_with_static,
+					 cc.meta_bytes, cc.frontier_points, cc.postings, cc.data_leaf_pages,
+					 cc.segments, cc.order_violations, cc.bound_violations,
+					 cc.tree_without_frontier);
+	PG_RETURN_TEXT_P(cstring_to_text(s.data));
+}
+
+/*
+ * rgin_debug_insert(index, lexeme, tid, payload): insert one posting with an
+ * arbitrary payload.  Research test hook for the duplicate-TID invariant.
+ */
+PG_FUNCTION_INFO_V1(rgin_debug_insert);
+
+Datum
+rgin_debug_insert(PG_FUNCTION_ARGS)
+{
+	text	   *lex = PG_GETARG_TEXT_PP(1);
+	ItemPointer tid = PG_GETARG_ITEMPOINTER(2);
+	int32		p = PG_GETARG_INT32(3);
+	GinState	gs;
+	Relation	index = index_open(PG_GETARG_OID(0), RowExclusiveLock);
+	char		payload[W];
+	int			flags;
+
+	if (!rgin_is_rgin_index(index))
+		elog(ERROR, "\"%s\" is not an rgin index", RelationGetRelationName(index));
+	rgin_init_state(&gs, index);
+	rgin_payload_put(payload, (RginPayload) p);
+	flags = ginEntryInsertPayload(&gs, FirstOffsetNumber,
+								  PointerGetDatum(cstring_to_text_with_len(VARDATA_ANY(lex),
+																		   VARSIZE_ANY_EXHDR(lex))),
+								  GIN_CAT_NORM_KEY, tid, payload, 1, NULL);
+	index_close(index, NoLock);
+	PG_RETURN_INT32(flags);
 }
 
 void
@@ -1422,12 +1743,13 @@ _PG_init(void)
 	DefineCustomEnumVariable("rgin.strategy", "Ranked scan strategy (full, c, auto).",
 							 NULL, &rgin_strategy, RGIN_STRATEGY_AUTO, strategy_options,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomEnumVariable("rgin.decode", "Posting decode unit (page: rest of page, segment: one segment).",
+							 NULL, &rgin_decode, RGIN_DECODE_PAGE, decode_options,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("rgin.pool_limit_kb", "C pool limit before exact FULL fallback.",
 							NULL, &rgin_pool_limit_kb, 65536, 64, MAX_KILOBYTES,
 							PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);
 	DefineCustomBoolVariable("rgin.verify", "Check every emitted score against the heap tsvector.",
 							 NULL, &rgin_verify, false, PGC_USERSET, 0, NULL, NULL, NULL);
-	DefineCustomBoolVariable("rgin.build_evidence", "Store root frontier and df entries at build.",
-							 NULL, &rgin_build_evidence, true, PGC_USERSET, 0, NULL, NULL, NULL);
 	MarkGUCPrefixReserved("rgin");
 }

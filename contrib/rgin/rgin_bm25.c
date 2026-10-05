@@ -1,6 +1,6 @@
 /*
  * rgin_bm25.c
- *		BM25 client of the research ranked GIN (M1 prototype).
+ *		BM25 opclass side of the research ranked GIN (M2 prototype).
  *
  * Score definition (M0.7): exact relative to the statistics generation G
  * carried by the bm25query datum, computed on the stored encodings:
@@ -135,21 +135,123 @@ rgin_contrib(RginPayload p, double idf, const RginQuery *q)
 	return w - w / (1.0 + tf / K);
 }
 
-ItemPointerData
-rgin_point_to_item(RginPayload p)
-{
-	ItemPointerData ip;
+/* ---------------------------------------------------------------- entry metadata */
 
-	ItemPointerSet(&ip, (BlockNumber) (p >> 8), (OffsetNumber) ((p & 0xff) + 1));
-	return ip;
+void
+rgin_meta_parse(const char *meta, int len, RginMeta *m)
+{
+	const uint8 *p = (const uint8 *) meta;
+	int			slen;
+	int			shift = 0;
+
+	m->has_static = false;
+	m->df = 0;
+	m->npoints = 0;
+	if (len == 0)
+		return;
+	slen = p[0];
+	if (1 + slen > len || (len - 1 - slen) % 2 != 0 ||
+		(len - 1 - slen) / 2 > RGIN_MAX_POINTS)
+		elog(ERROR, "rgin: malformed entry metadata (length %d)", len);
+	for (int i = 0; i < slen; i++)
+	{
+		m->df |= (int64) (p[1 + i] & 0x7f) << shift;
+		shift += 7;
+	}
+	m->has_static = (slen > 0);
+	m->npoints = (len - 1 - slen) / 2;
+	for (int i = 0; i < m->npoints; i++)
+		m->points[i] = rgin_payload_get(meta + 1 + slen + 2 * i);
 }
 
-RginPayload
-rgin_item_to_point(ItemPointer ip)
+static int
+rgin_meta_encode(const RginMeta *m, char *out, int maxlen)
 {
-	return (RginPayload) ((GinItemPointerGetBlockNumber(ip) << 8) |
-						  (GinItemPointerGetOffsetNumber(ip) - 1));
+	uint8		buf[10];
+	int			slen = 0;
+	int			len;
+
+	if (!m->has_static && m->npoints == 0)
+		return 0;
+	if (m->has_static)
+	{
+		uint64		v = (uint64) m->df;
+
+		do
+		{
+			buf[slen++] = (v & 0x7f) | (v > 0x7f ? 0x80 : 0);
+			v >>= 7;
+		} while (v > 0);
+	}
+	len = 1 + slen + 2 * m->npoints;
+	if (len > maxlen)
+		elog(ERROR, "rgin: entry metadata of %d bytes exceeds %d", len, maxlen);
+	out[0] = (char) slen;
+	memcpy(out + 1, buf, slen);
+	for (int i = 0; i < m->npoints; i++)
+		rgin_payload_put(out + 1 + slen + 2 * i, m->points[i]);
+	return len;
 }
+
+/*
+ * Replace m's frontier by the Pareto frontier of (frontier U payloads):
+ * higher tf and lower norm code dominate.  The result dominates every
+ * input point, so it never narrows the bound.  Canonical order (ascending
+ * code, ascending tf) makes an unchanged frontier encode identically.
+ */
+static void
+frontier_union(RginMeta *m, const char *payloads, int n)
+{
+	int			best[256];
+	int			maxtf = -1;
+
+	for (int c = 0; c < 256; c++)
+		best[c] = -1;
+	for (int i = 0; i < m->npoints; i++)
+		best[m->points[i] & 0xff] = Max(best[m->points[i] & 0xff], m->points[i] >> 8);
+	for (int i = 0; i < n; i++)
+	{
+		RginPayload p = rgin_payload_get(payloads + i * RGIN_PAYLOAD_WIDTH);
+
+		best[p & 0xff] = Max(best[p & 0xff], p >> 8);
+	}
+	m->npoints = 0;
+	for (int c = 0; c < 256; c++)
+	{
+		if (best[c] > maxtf)
+		{
+			m->points[m->npoints++] = (RginPayload) ((best[c] << 8) | c);
+			maxtf = best[c];
+		}
+	}
+}
+
+/*
+ * GinPayloadOps.metaUpdate: build postings count into df_G (static); a
+ * posting-tree key keeps the frontier of all its payloads (dynamic).
+ * Posting-list keys carry no frontier: the scan reads their payloads.
+ */
+static int
+rgin_meta_update(GinState *ginstate, const char *oldmeta, int oldlen,
+				 const char *payloads, int npayloads,
+				 bool isBuild, bool isTree, char *out, int maxlen)
+{
+	RginMeta	m;
+
+	rgin_meta_parse(oldmeta, oldlen, &m);
+	if (isBuild)
+	{
+		m.has_static = true;
+		m.df += npayloads;
+	}
+	if (isTree)
+		frontier_union(&m, payloads, npayloads);
+	return rgin_meta_encode(&m, out, maxlen);
+}
+
+const GinPayloadOps rgin_bm25_payload_ops = {
+	.metaUpdate = rgin_meta_update,
+};
 
 /* ---------------------------------------------------------------- tsvector side */
 
@@ -268,22 +370,6 @@ typedef struct QCache
 	RginQuery  *result;
 } QCache;
 
-static int64
-read_scalar(Relation index, GinState *gs, char tag, const char *name, int len, bool must)
-{
-	int			n;
-	ItemPointer items = rgin_read_magic(index, gs, tag, name, len, &n);
-
-	if (items == NULL || n != 1)
-	{
-		if (must)
-			elog(ERROR, "rgin: missing statistics entry in index \"%s\"",
-				 RelationGetRelationName(index));
-		return 0;
-	}
-	return (int64) GinItemPointerGetBlockNumber(&items[0]);
-}
-
 /*
  * bm25query(index regclass, query tsquery, k1 float8, b float8)
  *
@@ -311,6 +397,7 @@ bm25query_make(PG_FUNCTION_ARGS)
 	char	   *p;
 	int64		N,
 				sumdl;
+	RginIndexMeta im;
 
 	if (!(k1 >= 0.0) || !(b >= 0.0 && b <= 1.0))
 		ereport(ERROR,
@@ -360,9 +447,10 @@ bm25query_make(PG_FUNCTION_ARGS)
 	for (int i = 0; i < nlx; i++)
 		strbytes += lx[i].len;
 
-	initGinState(&gs, index);
-	N = read_scalar(index, &gs, RGIN_TAG_STATS, "N", 1, true);
-	sumdl = read_scalar(index, &gs, RGIN_TAG_STATS, "S", 1, true);
+	rgin_init_state(&gs, index);
+	rgin_read_index_meta(index, &im);
+	N = im.N;
+	sumdl = im.sumdl;
 
 	size = offsetof(RginQuery, terms) + sizeof(RginQTerm) * nlx + strbytes;
 	q = palloc0(size);
@@ -379,12 +467,11 @@ bm25query_make(PG_FUNCTION_ARGS)
 	{
 		int64		df = 0;
 		double		idf;
-		int			nf;
-		ItemPointer fi = rgin_read_magic(index, &gs, RGIN_TAG_FRONTIER,
-										 lx[i].lex, lx[i].len, &nf);
+		RginTermInfo ti;
 
-		if (fi && !RGIN_IS_POINT(&fi[nf - 1]))
-			df = (int64) GinItemPointerGetBlockNumber(&fi[nf - 1]) - RGIN_DF_BLOCK_BASE;
+		rgin_lookup_term(index, &gs, lx[i].lex, lx[i].len, false, &ti);
+		if (ti.found && ti.meta.has_static)
+			df = ti.meta.df;
 
 		df = Min(df, N);		/* consistent generation: df <= N */
 		idf = log(1.0 + ((double) N - (double) df + 0.5) / ((double) df + 0.5));

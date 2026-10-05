@@ -1,4 +1,4 @@
-/* contrib/rgin/rgin--1.0.sql -- research ranked GIN (M1 prototype) */
+/* contrib/rgin/rgin--1.0.sql -- research ranked GIN (M2 prototype) */
 
 \echo Use "CREATE EXTENSION rgin" to load this file. \quit
 
@@ -57,6 +57,8 @@ CREATE OPERATOR CLASS rgin_tsvector_ops DEFAULT FOR TYPE tsvector USING rgin AS
 -- instrumentation
 CREATE FUNCTION rgin_last_stats() RETURNS text AS 'MODULE_PATHNAME' LANGUAGE C;
 CREATE FUNCTION rgin_build_info() RETURNS text AS 'MODULE_PATHNAME' LANGUAGE C;
-CREATE FUNCTION rgin_widen_events() RETURNS int8 AS 'MODULE_PATHNAME' LANGUAGE C;
-CREATE FUNCTION rgin_term_frontier(regclass, text) RETURNS int4 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+CREATE FUNCTION rgin_insert_info() RETURNS text AS 'MODULE_PATHNAME' LANGUAGE C;
+CREATE FUNCTION rgin_term_meta(regclass, text) RETURNS text AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION rgin_term_frontier_points(regclass, text) RETURNS int4[] AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+CREATE FUNCTION rgin_check(regclass) RETURNS text AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+CREATE FUNCTION rgin_debug_insert(regclass, text, tid, int4) RETURNS int4 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

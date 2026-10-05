@@ -8,7 +8,7 @@ OBJS = \
 
 EXTENSION = rgin
 DATA = rgin--1.0.sql
-PGFILEDESC = "rgin - research ranked GIN access method (M1 prototype)"
+PGFILEDESC = "rgin - research ranked GIN access method (M2 prototype)"
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

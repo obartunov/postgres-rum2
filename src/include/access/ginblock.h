@@ -343,4 +343,25 @@ typedef struct
 #define SizeOfGinPostingList(plist) (offsetof(GinPostingList, bytes) + SHORTALIGN((plist)->nbytes) )
 #define GinNextPostingListSegment(cur) ((GinPostingList *) (((char *) (cur)) + SizeOfGinPostingList((cur))))
 
+/*
+ * In an index with payload width W > 0, 'nbytes' still counts all bytes
+ * after the header, so segment sizes and walking are unchanged.  They are:
+ *
+ *		uint16 nitems | varbyte TID deltas | payload[nitems][W]
+ *
+ * payload[0] belongs to 'first'.  Payload bytes are opaque and unaligned;
+ * access them with memcpy only.
+ */
+static inline int
+GinPayloadListGetNItems(const GinPostingList *plist)
+{
+	uint16		n;
+
+	memcpy(&n, plist->bytes, sizeof(uint16));
+	return n;
+}
+
+#define GinPayloadListGetPayloads(plist, w) \
+	((char *) (plist)->bytes + (plist)->nbytes - GinPayloadListGetNItems(plist) * (w))
+
 #endif							/* GINBLOCK_H */

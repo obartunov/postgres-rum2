@@ -432,3 +432,217 @@ ginMergeItemPointers(ItemPointerData *a, uint32 na,
 
 	return dst;
 }
+
+
+/*
+ * Payload posting lists (payload width W > 0).  See GinPostingList in
+ * ginblock.h for the layout.  Ordering and duplicate elimination use the
+ * TID only; the payload of an item travels with it.
+ */
+
+/*
+ * Like ginCompressPostingList, for an index with payload width W.  The
+ * payload of ipd[i] is payloads[i * W .. (i + 1) * W).
+ */
+GinPostingList *
+ginCompressPostingListPayload(const ItemPointerData *ipd, const char *payloads,
+							  int payloadWidth, int nipd, int maxsize,
+							  int *nwritten)
+{
+	uint64		prev;
+	int			totalpacked;
+	int			budget;
+	GinPostingList *result;
+	unsigned char *ptr;
+	uint16		n;
+
+	Assert(payloadWidth > 0 && nipd > 0);
+	maxsize = SHORTALIGN_DOWN(maxsize);
+	result = palloc(maxsize);
+
+	/* header, item count and the first item's payload must always fit */
+	budget = maxsize - offsetof(GinPostingList, bytes) - sizeof(uint16) - payloadWidth;
+	Assert(budget >= 0);
+
+	result->first = ipd[0];
+	prev = itemptr_to_uint64(&result->first);
+	ptr = result->bytes + sizeof(uint16);
+	for (totalpacked = 1; totalpacked < nipd; totalpacked++)
+	{
+		uint64		val = itemptr_to_uint64(&ipd[totalpacked]);
+		unsigned char buf[MaxBytesPerInteger];
+		unsigned char *p = buf;
+
+		Assert(val > prev);
+		encode_varbyte(val - prev, &p);
+		if ((p - buf) + payloadWidth > budget)
+			break;				/* output is full */
+		memcpy(ptr, buf, p - buf);
+		ptr += p - buf;
+		budget -= (p - buf) + payloadWidth;
+		prev = val;
+	}
+
+	n = totalpacked;
+	memcpy(result->bytes, &n, sizeof(uint16));
+	memcpy(ptr, payloads, (Size) totalpacked * payloadWidth);
+	ptr += totalpacked * payloadWidth;
+	result->nbytes = ptr - result->bytes;
+	if (result->nbytes != SHORTALIGN(result->nbytes))
+		result->bytes[result->nbytes] = 0;
+
+	if (nwritten)
+		*nwritten = totalpacked;
+
+	Assert(SizeOfGinPostingList(result) <= maxsize);
+
+#if defined (CHECK_ENCODING_ROUNDTRIP)
+	{
+		int			ndecoded;
+		char	   *ptmp;
+		ItemPointer tmp = ginPostingListDecodePayload(result, payloadWidth,
+													  &ndecoded, &ptmp);
+
+		Assert(ndecoded == totalpacked);
+		Assert(memcmp(tmp, ipd, ndecoded * sizeof(ItemPointerData)) == 0);
+		Assert(memcmp(ptmp, payloads, (Size) ndecoded * payloadWidth) == 0);
+		pfree(tmp);
+		pfree(ptmp);
+	}
+#endif
+
+	return result;
+}
+
+/*
+ * Decode consecutive payload segments of total size 'len'.  TIDs are
+ * returned as a palloc'd array, payloads as a palloc'd byte array in
+ * *payloads_out (both parallel, *ndecoded_out items).
+ */
+ItemPointer
+ginPostingListDecodeAllSegmentsPayload(GinPostingList *segment, int len,
+									   int payloadWidth, int *ndecoded_out,
+									   char **payloads_out)
+{
+	char	   *endseg = ((char *) segment) + len;
+	GinPostingList *seg;
+	ItemPointer result;
+	char	   *pres;
+	int			total = 0;
+	int			ndecoded = 0;
+
+	Assert(payloadWidth > 0);
+
+	/* item counts are in the segment headers, so size the arrays exactly */
+	for (seg = segment; (char *) seg < endseg; seg = GinNextPostingListSegment(seg))
+		total += GinPayloadListGetNItems(seg);
+
+	result = palloc_array(ItemPointerData, Max(total, 1));
+	pres = palloc(Max((Size) total * payloadWidth, 1));
+
+	for (seg = segment; (char *) seg < endseg; seg = GinNextPostingListSegment(seg))
+	{
+		int			nitems = GinPayloadListGetNItems(seg);
+		char	   *pl = GinPayloadListGetPayloads(seg, payloadWidth);
+		unsigned char *ptr = seg->bytes + sizeof(uint16);
+		unsigned char *endptr = (unsigned char *) pl;
+		uint64		val;
+		int			start = ndecoded;
+
+		Assert(nitems > 0);
+		Assert(ndecoded == 0 || ginCompareItemPointers(&seg->first, &result[ndecoded - 1]) > 0);
+		result[ndecoded++] = seg->first;
+		val = itemptr_to_uint64(&seg->first);
+		while (ptr < endptr)
+		{
+			if (ndecoded >= total)
+				elog(ERROR, "GIN payload posting list holds more items than its header says");
+			val += decode_varbyte(&ptr);
+			uint64_to_itemptr(val, &result[ndecoded]);
+			ndecoded++;
+		}
+		if (ndecoded - start != nitems)
+			elog(ERROR, "number of items mismatch in GIN payload posting list, %d in header, %d decoded",
+				 nitems, ndecoded - start);
+		memcpy(pres + (Size) start * payloadWidth, pl, (Size) nitems * payloadWidth);
+	}
+
+	*ndecoded_out = ndecoded;
+	*payloads_out = pres;
+	return result;
+}
+
+ItemPointer
+ginPostingListDecodePayload(GinPostingList *plist, int payloadWidth,
+							int *ndecoded_out, char **payloads_out)
+{
+	return ginPostingListDecodeAllSegmentsPayload(plist,
+												  SizeOfGinPostingList(plist),
+												  payloadWidth, ndecoded_out,
+												  payloads_out);
+}
+
+/*
+ * Merge two ordered (TID, payload) arrays.  An item present in both keeps
+ * one copy; its payloads must be equal, since one key and one heap TID have
+ * exactly one payload.  Unequal payloads raise an error.
+ */
+ItemPointer
+ginMergeItemPointersPayload(ItemPointerData *a, char *pa, uint32 na,
+							ItemPointerData *b, char *pb, uint32 nb,
+							int payloadWidth, int *nmerged, char **pmerged)
+{
+	ItemPointerData *dst = palloc_array(ItemPointerData, na + nb);
+	char	   *pdst = palloc(Max((Size) (na + nb) * payloadWidth, 1));
+	uint32		i = 0,
+				j = 0,
+				k = 0;
+
+	while (i < na && j < nb)
+	{
+		int			cmp = ginCompareItemPointers(&a[i], &b[j]);
+
+		if (cmp < 0)
+		{
+			dst[k] = a[i];
+			memcpy(pdst + (Size) k * payloadWidth, pa + (Size) i * payloadWidth, payloadWidth);
+			i++;
+		}
+		else
+		{
+			if (cmp == 0)
+			{
+				if (memcmp(pa + (Size) i * payloadWidth, pb + (Size) j * payloadWidth,
+						   payloadWidth) != 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_INTERNAL_ERROR),
+							 errmsg("conflicting GIN posting payloads for heap TID (%u,%u)",
+									GinItemPointerGetBlockNumber(&b[j]),
+									GinItemPointerGetOffsetNumber(&b[j]))));
+				i++;
+			}
+			dst[k] = b[j];
+			memcpy(pdst + (Size) k * payloadWidth, pb + (Size) j * payloadWidth, payloadWidth);
+			j++;
+		}
+		k++;
+	}
+	if (i < na)
+	{
+		memcpy(&dst[k], &a[i], (na - i) * sizeof(ItemPointerData));
+		memcpy(pdst + (Size) k * payloadWidth, pa + (Size) i * payloadWidth,
+			   (Size) (na - i) * payloadWidth);
+		k += na - i;
+	}
+	if (j < nb)
+	{
+		memcpy(&dst[k], &b[j], (nb - j) * sizeof(ItemPointerData));
+		memcpy(pdst + (Size) k * payloadWidth, pb + (Size) j * payloadWidth,
+			   (Size) (nb - j) * payloadWidth);
+		k += nb - j;
+	}
+
+	*nmerged = k;
+	*pmerged = pdst;
+	return dst;
+}

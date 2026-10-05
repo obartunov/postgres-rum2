@@ -174,6 +174,9 @@ typedef struct GinBtreeData
 
 	/* Search key for data tree (posting tree) */
 	ItemPointerData itemptr;
+
+	/* Posting payload width of a data tree; zero for ordinary GIN */
+	int			payloadWidth;
 } GinBtreeData;
 
 /* This represents a tuple to be inserted to entry tree. */
@@ -190,6 +193,7 @@ typedef struct
 typedef struct
 {
 	ItemPointerData *items;
+	char	   *payloads;		/* nitem * payloadWidth bytes, or NULL */
 	uint32		nitem;
 	uint32		curitem;
 } GinBtreeDataLeafInsertData;
@@ -219,6 +223,18 @@ extern ItemPointer ginReadTuple(GinState *ginstate, OffsetNumber attnum,
 
 /* gindatapage.c */
 extern ItemPointer GinDataLeafPageGetItems(Page page, int *nitems, ItemPointerData advancePast);
+extern ItemPointer GinDataLeafPageGetItemsPayload(Page page, int payloadWidth, int *nitems,
+												  ItemPointerData advancePast, char **payloads);
+extern GinPostingList *GinDataLeafPageFindSegment(Page page, ItemPointerData advancePast,
+												  char **endptr);
+extern BlockNumber createPostingTreePayload(Relation index,
+											ItemPointerData *items, char *payloads,
+											int payloadWidth, uint32 nitems,
+											GinStatsData *buildStats, Buffer entrybuffer);
+extern void ginInsertItemPointersPayload(Relation index, BlockNumber rootBlkno,
+										 ItemPointerData *items, char *payloads,
+										 int payloadWidth, uint32 nitem,
+										 GinStatsData *buildStats);
 extern int	GinDataLeafPageGetItemsToTbm(Page page, TIDBitmap *tbm);
 extern BlockNumber createPostingTree(Relation index,
 									 ItemPointerData *items, uint32 nitems,
@@ -483,6 +499,19 @@ extern ItemPointer ginPostingListDecode(GinPostingList *plist, int *ndecoded_out
 extern ItemPointer ginMergeItemPointers(ItemPointerData *a, uint32 na,
 										ItemPointerData *b, uint32 nb,
 										int *nmerged);
+
+extern GinPostingList *ginCompressPostingListPayload(const ItemPointerData *ipd,
+													 const char *payloads, int payloadWidth,
+													 int nipd, int maxsize, int *nwritten);
+extern ItemPointer ginPostingListDecodeAllSegmentsPayload(GinPostingList *segment, int len,
+														  int payloadWidth, int *ndecoded_out,
+														  char **payloads_out);
+extern ItemPointer ginPostingListDecodePayload(GinPostingList *plist, int payloadWidth,
+											   int *ndecoded_out, char **payloads_out);
+extern ItemPointer ginMergeItemPointersPayload(ItemPointerData *a, char *pa, uint32 na,
+											   ItemPointerData *b, char *pb, uint32 nb,
+											   int payloadWidth, int *nmerged,
+											   char **pmerged);
 
 /*
  * Merging the results of several gin scans compares item pointers a lot,

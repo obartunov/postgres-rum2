@@ -41,6 +41,8 @@
  * for N items, at minimum.
  */
 #define MinTuplesPerSegment ((GinPostingListSegmentMaxSize - 2) / 6)
+#define MinTuplesPerPayloadSegment(w) \
+	((GinPostingListSegmentMaxSize - 2 - sizeof(uint16)) / (6 + (w)))
 
 /*
  * A working struct for manipulating a posting tree leaf page.
@@ -58,6 +60,7 @@ typedef struct
 	int			rsize;			/* total size on right page */
 
 	bool		oldformat;		/* page is in pre-9.4 format on disk */
+	int			payloadWidth;	/* posting payload width, 0 if none */
 
 	/*
 	 * If we need WAL data representing the reconstructed leaf page, it's
@@ -99,6 +102,7 @@ typedef struct
 	 */
 	GinPostingList *seg;
 	ItemPointer items;
+	char	   *payloads;		/* parallel to 'items' if payloadWidth > 0 */
 	int			nitems;			/* # of items in 'items', if items != NULL */
 } leafSegmentInfo;
 
@@ -111,7 +115,8 @@ static void dataSplitPageInternal(GinBtree btree, Buffer origbuf,
 static disassembledLeaf *disassembleLeaf(Page page);
 static bool leafRepackItems(disassembledLeaf *leaf, ItemPointer remaining);
 static bool addItemsToLeaf(disassembledLeaf *leaf, ItemPointer newItems,
-						   int nNewItems);
+						   char *newPayloads, int nNewItems);
+static void leafSegmentDecode(disassembledLeaf *leaf, leafSegmentInfo *seginfo);
 
 static void computeLeafRecompressWALData(disassembledLeaf *leaf);
 static void dataPlaceToPageLeafRecompress(Buffer buf, disassembledLeaf *leaf);
@@ -173,6 +178,59 @@ GinDataLeafPageGetItems(Page page, int *nitems, ItemPointerData advancePast)
 	}
 
 	return result;
+}
+
+/*
+ * Payload variant of GinDataLeafPageGetItems: decodes from the segment
+ * covering advancePast+1 to the end of the page, returning payloads in
+ * *payloads.  Payload pages are always compressed.
+ */
+ItemPointer
+GinDataLeafPageGetItemsPayload(Page page, int payloadWidth, int *nitems,
+							   ItemPointerData advancePast, char **payloads)
+{
+	char	   *endptr;
+	GinPostingList *seg = GinDataLeafPageFindSegment(page, advancePast, &endptr);
+
+	Assert(payloadWidth > 0);
+	if (seg == NULL)
+	{
+		*nitems = 0;
+		*payloads = NULL;
+		return NULL;
+	}
+	return ginPostingListDecodeAllSegmentsPayload(seg, endptr - (char *) seg,
+												  payloadWidth, nitems, payloads);
+}
+
+/*
+ * Return the segment of a compressed leaf page that may hold the first item
+ * > advancePast (the first segment if advancePast is invalid), or NULL if
+ * the page has no segments.  *endptr is set to the end of the last segment.
+ * Following segments are reached with GinNextPostingListSegment; this lets
+ * a caller decode exactly one segment at a time.
+ */
+GinPostingList *
+GinDataLeafPageFindSegment(Page page, ItemPointerData advancePast, char **endptr)
+{
+	GinPostingList *seg = GinDataLeafPageGetPostingList(page);
+	GinPostingList *next;
+
+	Assert(GinPageIsCompressed(page));
+	*endptr = (char *) seg + GinDataLeafPageGetPostingListSize(page);
+	if ((char *) seg >= *endptr)
+		return NULL;
+	if (ItemPointerIsValid(&advancePast))
+	{
+		next = GinNextPostingListSegment(seg);
+		while ((char *) next < *endptr &&
+			   ginCompareItemPointers(&next->first, &advancePast) <= 0)
+		{
+			seg = next;
+			next = GinNextPostingListSegment(seg);
+		}
+	}
+	return seg;
 }
 
 /*
@@ -452,6 +510,7 @@ dataBeginPlaceToPageLeaf(GinBtree btree, Buffer buf, GinBtreeStack *stack,
 {
 	GinBtreeDataLeafInsertData *items = insertdata;
 	ItemPointer newItems = &items->items[items->curitem];
+	char	   *newPayloads = NULL;
 	int			maxitems = items->nitem - items->curitem;
 	Page		page = BufferGetPage(buf);
 	int			i;
@@ -491,6 +550,12 @@ dataBeginPlaceToPageLeaf(GinBtree btree, Buffer buf, GinBtreeStack *stack,
 
 	/* Disassemble the data on the page */
 	leaf = disassembleLeaf(page);
+	if (btree->payloadWidth > 0)
+	{
+		Assert(GinPageIsCompressed(page) && items->payloads != NULL);
+		leaf->payloadWidth = btree->payloadWidth;
+		newPayloads = items->payloads + (Size) items->curitem * btree->payloadWidth;
+	}
 
 	/*
 	 * Are we appending to the end of the page? IOW, are all the new items
@@ -500,9 +565,7 @@ dataBeginPlaceToPageLeaf(GinBtree btree, Buffer buf, GinBtreeStack *stack,
 	{
 		lastleftinfo = dlist_container(leafSegmentInfo, node,
 									   dlist_tail_node(&leaf->segments));
-		if (!lastleftinfo->items)
-			lastleftinfo->items = ginPostingListDecode(lastleftinfo->seg,
-													   &lastleftinfo->nitems);
+		leafSegmentDecode(leaf, lastleftinfo);
 		maxOldItem = lastleftinfo->items[lastleftinfo->nitems - 1];
 		if (ginCompareItemPointers(&newItems[0], &maxOldItem) >= 0)
 			append = true;
@@ -551,11 +614,15 @@ dataBeginPlaceToPageLeaf(GinBtree btree, Buffer buf, GinBtreeStack *stack,
 
 		nnewsegments = freespace / GinPostingListSegmentMaxSize;
 		nnewsegments += GinDataPageMaxDataSize / GinPostingListSegmentMaxSize;
-		maxitems = Min(maxitems, nnewsegments * MinTuplesPerSegment);
+		if (leaf->payloadWidth > 0)
+			maxitems = Min(maxitems,
+						   nnewsegments * MinTuplesPerPayloadSegment(leaf->payloadWidth));
+		else
+			maxitems = Min(maxitems, nnewsegments * MinTuplesPerSegment);
 	}
 
 	/* Add the new items to the segment list */
-	if (!addItemsToLeaf(leaf, newItems, maxitems))
+	if (!addItemsToLeaf(leaf, newItems, newPayloads, maxitems))
 	{
 		/* all items were duplicates, we have nothing to do */
 		items->curitem += maxitems;
@@ -673,9 +740,7 @@ dataBeginPlaceToPageLeaf(GinBtree btree, Buffer buf, GinBtreeStack *stack,
 		 * right bound of the page.
 		 */
 		lastleftinfo = dlist_container(leafSegmentInfo, node, leaf->lastleft);
-		if (!lastleftinfo->items)
-			lastleftinfo->items = ginPostingListDecode(lastleftinfo->seg,
-													   &lastleftinfo->nitems);
+		leafSegmentDecode(leaf, lastleftinfo);
 		lbound = lastleftinfo->items[lastleftinfo->nitems - 1];
 
 		/*
@@ -917,6 +982,9 @@ computeLeafRecompressWALData(disassembledLeaf *leaf)
 
 		if (action != GIN_SEGMENT_DELETE)
 			segsize = SizeOfGinPostingList(seginfo->seg);
+
+		/* ADDITEMS carries TIDs only; payload pages always use REPLACE */
+		Assert(leaf->payloadWidth == 0 || action != GIN_SEGMENT_ADDITEMS);
 
 		/*
 		 * If storing the uncompressed list of added item pointers would take
@@ -1392,6 +1460,7 @@ disassembleLeaf(Page page)
 			seginfo->action = GIN_SEGMENT_UNMODIFIED;
 			seginfo->seg = seg;
 			seginfo->items = NULL;
+			seginfo->payloads = NULL;
 			seginfo->nitems = 0;
 			dlist_push_tail(&leaf->segments, &seginfo->node);
 
@@ -1418,6 +1487,7 @@ disassembleLeaf(Page page)
 
 			seginfo->action = GIN_SEGMENT_REPLACE;
 			seginfo->seg = NULL;
+			seginfo->payloads = NULL;
 			seginfo->items = palloc_array(ItemPointerData, nuncompressed);
 			memcpy(seginfo->items, uncompressed, nuncompressed * sizeof(ItemPointerData));
 			seginfo->nitems = nuncompressed;
@@ -1441,10 +1511,13 @@ disassembleLeaf(Page page)
  * duplicates of existing items on the page.
  */
 static bool
-addItemsToLeaf(disassembledLeaf *leaf, ItemPointer newItems, int nNewItems)
+addItemsToLeaf(disassembledLeaf *leaf, ItemPointer newItems, char *newPayloads,
+			   int nNewItems)
 {
 	dlist_iter	iter;
 	ItemPointer nextnew = newItems;
+	char	   *nextnewp = newPayloads;
+	int			w = leaf->payloadWidth;
 	int			newleft = nNewItems;
 	bool		modified = false;
 	leafSegmentInfo *newseg;
@@ -1458,6 +1531,7 @@ addItemsToLeaf(disassembledLeaf *leaf, ItemPointer newItems, int nNewItems)
 		newseg = palloc_object(leafSegmentInfo);
 		newseg->seg = NULL;
 		newseg->items = newItems;
+		newseg->payloads = newPayloads;
 		newseg->nitems = nNewItems;
 		newseg->action = GIN_SEGMENT_INSERT;
 		dlist_push_tail(&leaf->segments, &newseg->node);
@@ -1499,8 +1573,7 @@ addItemsToLeaf(disassembledLeaf *leaf, ItemPointer newItems, int nNewItems)
 			continue;
 
 		/* Merge the new items with the existing items. */
-		if (!cur->items)
-			cur->items = ginPostingListDecode(cur->seg, &cur->nitems);
+		leafSegmentDecode(leaf, cur);
 
 		/*
 		 * Fast path for the important special case that we're appending to
@@ -1515,11 +1588,41 @@ addItemsToLeaf(disassembledLeaf *leaf, ItemPointer newItems, int nNewItems)
 			newseg = palloc_object(leafSegmentInfo);
 			newseg->seg = NULL;
 			newseg->items = nextnew;
+			newseg->payloads = nextnewp;
 			newseg->nitems = nthis;
 			newseg->action = GIN_SEGMENT_INSERT;
 			dlist_push_tail(&leaf->segments, &newseg->node);
 			modified = true;
 			break;
+		}
+
+		if (w > 0)
+		{
+			char	   *tmppayloads;
+
+			/*
+			 * A payload segment is always rewritten as a whole (REPLACE): the
+			 * ADDITEMS WAL action carries TIDs only.
+			 */
+			tmpitems = ginMergeItemPointersPayload(cur->items, cur->payloads,
+												   cur->nitems,
+												   nextnew, nextnewp, nthis,
+												   w, &ntmpitems, &tmppayloads);
+			if (ntmpitems != cur->nitems)
+			{
+				cur->action = GIN_SEGMENT_REPLACE;
+				cur->items = tmpitems;
+				cur->payloads = tmppayloads;
+				cur->nitems = ntmpitems;
+				cur->seg = NULL;
+				modified = true;
+			}
+			nextnew += nthis;
+			nextnewp += (Size) nthis * w;
+			newleft -= nthis;
+			if (newleft == 0)
+				break;
+			continue;
 		}
 
 		tmpitems = ginMergeItemPointers(cur->items, cur->nitems,
@@ -1605,6 +1708,13 @@ leafRepackItems(disassembledLeaf *leaf, ItemPointer remaining)
 			{
 				if (seginfo->nitems > GinPostingListSegmentMaxSize)
 					npacked = 0;	/* no chance that it would fit. */
+				else if (leaf->payloadWidth > 0)
+					seginfo->seg = ginCompressPostingListPayload(seginfo->items,
+																 seginfo->payloads,
+																 leaf->payloadWidth,
+																 seginfo->nitems,
+																 GinPostingListSegmentMaxSize,
+																 &npacked);
 				else
 				{
 					seginfo->seg = ginCompressPostingList(seginfo->items,
@@ -1622,10 +1732,18 @@ leafRepackItems(disassembledLeaf *leaf, ItemPointer remaining)
 					 */
 					if (seginfo->seg)
 						pfree(seginfo->seg);
-					seginfo->seg = ginCompressPostingList(seginfo->items,
-														  seginfo->nitems,
-														  GinPostingListSegmentTargetSize,
-														  &npacked);
+					if (leaf->payloadWidth > 0)
+						seginfo->seg = ginCompressPostingListPayload(seginfo->items,
+																	 seginfo->payloads,
+																	 leaf->payloadWidth,
+																	 seginfo->nitems,
+																	 GinPostingListSegmentTargetSize,
+																	 &npacked);
+					else
+						seginfo->seg = ginCompressPostingList(seginfo->items,
+															  seginfo->nitems,
+															  GinPostingListSegmentTargetSize,
+															  &npacked);
 					if (seginfo->action != GIN_SEGMENT_INSERT)
 						seginfo->action = GIN_SEGMENT_REPLACE;
 
@@ -1633,6 +1751,8 @@ leafRepackItems(disassembledLeaf *leaf, ItemPointer remaining)
 					nextseg->action = GIN_SEGMENT_INSERT;
 					nextseg->seg = NULL;
 					nextseg->items = &seginfo->items[npacked];
+					nextseg->payloads = seginfo->payloads ?
+						seginfo->payloads + (Size) npacked * leaf->payloadWidth : NULL;
 					nextseg->nitems = seginfo->nitems - npacked;
 					next_node = &nextseg->node;
 					dlist_insert_after(cur_node, next_node);
@@ -1648,16 +1768,21 @@ leafRepackItems(disassembledLeaf *leaf, ItemPointer remaining)
 
 				nextseg = dlist_container(leafSegmentInfo, node, next_node);
 
-				if (seginfo->items == NULL)
-					seginfo->items = ginPostingListDecode(seginfo->seg,
-														  &seginfo->nitems);
-				if (nextseg->items == NULL)
-					nextseg->items = ginPostingListDecode(nextseg->seg,
-														  &nextseg->nitems);
-				nextseg->items =
-					ginMergeItemPointers(seginfo->items, seginfo->nitems,
-										 nextseg->items, nextseg->nitems,
-										 &nmerged);
+				leafSegmentDecode(leaf, seginfo);
+				leafSegmentDecode(leaf, nextseg);
+				if (leaf->payloadWidth > 0)
+					nextseg->items =
+						ginMergeItemPointersPayload(seginfo->items, seginfo->payloads,
+													seginfo->nitems,
+													nextseg->items, nextseg->payloads,
+													nextseg->nitems,
+													leaf->payloadWidth, &nmerged,
+													&nextseg->payloads);
+				else
+					nextseg->items =
+						ginMergeItemPointers(seginfo->items, seginfo->nitems,
+											 nextseg->items, nextseg->nitems,
+											 &nmerged);
 				Assert(nmerged == seginfo->nitems + nextseg->nitems);
 				nextseg->nitems = nmerged;
 				nextseg->seg = NULL;
@@ -1679,6 +1804,7 @@ leafRepackItems(disassembledLeaf *leaf, ItemPointer remaining)
 			}
 
 			seginfo->items = NULL;
+			seginfo->payloads = NULL;
 			seginfo->nitems = 0;
 		}
 
@@ -1763,6 +1889,25 @@ leafRepackItems(disassembledLeaf *leaf, ItemPointer remaining)
 }
 
 
+/*
+ * Decode a segment's items (and, in a payload index, its payloads) into
+ * seginfo, unless already done.
+ */
+static void
+leafSegmentDecode(disassembledLeaf *leaf, leafSegmentInfo *seginfo)
+{
+	if (seginfo->items)
+		return;
+	if (leaf->payloadWidth > 0)
+		seginfo->items = ginPostingListDecodePayload(seginfo->seg,
+													 leaf->payloadWidth,
+													 &seginfo->nitems,
+													 &seginfo->payloads);
+	else
+		seginfo->items = ginPostingListDecode(seginfo->seg, &seginfo->nitems);
+}
+
+
 /*** Functions that are exported to the rest of the GIN code ***/
 
 /*
@@ -1774,6 +1919,19 @@ leafRepackItems(disassembledLeaf *leaf, ItemPointer remaining)
 BlockNumber
 createPostingTree(Relation index, ItemPointerData *items, uint32 nitems,
 				  GinStatsData *buildStats, Buffer entrybuffer)
+{
+	return createPostingTreePayload(index, items, NULL, 0, nitems,
+									buildStats, entrybuffer);
+}
+
+/*
+ * createPostingTree for an index with posting payload width payloadWidth
+ * (0: ordinary GIN, payloads ignored).
+ */
+BlockNumber
+createPostingTreePayload(Relation index, ItemPointerData *items, char *payloads,
+						 int payloadWidth, uint32 nitems,
+						 GinStatsData *buildStats, Buffer entrybuffer)
 {
 	BlockNumber blkno;
 	Buffer		buffer;
@@ -1802,10 +1960,18 @@ createPostingTree(Relation index, ItemPointerData *items, uint32 nitems,
 		int			npacked;
 		int			segsize;
 
-		segment = ginCompressPostingList(&items[nrootitems],
-										 nitems - nrootitems,
-										 GinPostingListSegmentMaxSize,
-										 &npacked);
+		if (payloadWidth > 0)
+			segment = ginCompressPostingListPayload(&items[nrootitems],
+													payloads + (Size) nrootitems * payloadWidth,
+													payloadWidth,
+													nitems - nrootitems,
+													GinPostingListSegmentMaxSize,
+													&npacked);
+		else
+			segment = ginCompressPostingList(&items[nrootitems],
+											 nitems - nrootitems,
+											 GinPostingListSegmentMaxSize,
+											 &npacked);
 		segsize = SizeOfGinPostingList(segment);
 		if (rootsize + segsize > GinDataPageMaxDataSize)
 			break;
@@ -1869,10 +2035,12 @@ createPostingTree(Relation index, ItemPointerData *items, uint32 nitems,
 	 */
 	if (nitems > nrootitems)
 	{
-		ginInsertItemPointers(index, blkno,
-							  items + nrootitems,
-							  nitems - nrootitems,
-							  buildStats);
+		ginInsertItemPointersPayload(index, blkno,
+									 items + nrootitems,
+									 payloads ? payloads + (Size) nrootitems * payloadWidth : NULL,
+									 payloadWidth,
+									 nitems - nrootitems,
+									 buildStats);
 	}
 
 	return blkno;
@@ -1909,13 +2077,29 @@ ginInsertItemPointers(Relation index, BlockNumber rootBlkno,
 					  ItemPointerData *items, uint32 nitem,
 					  GinStatsData *buildStats)
 {
+	ginInsertItemPointersPayload(index, rootBlkno, items, NULL, 0, nitem,
+								 buildStats);
+}
+
+/*
+ * ginInsertItemPointers for an index with posting payload width payloadWidth
+ * (0: ordinary GIN, payloads ignored).
+ */
+void
+ginInsertItemPointersPayload(Relation index, BlockNumber rootBlkno,
+							 ItemPointerData *items, char *payloads,
+							 int payloadWidth, uint32 nitem,
+							 GinStatsData *buildStats)
+{
 	GinBtreeData btree;
 	GinBtreeDataLeafInsertData insertdata;
 	GinBtreeStack *stack;
 
 	ginPrepareDataScan(&btree, index, rootBlkno);
 	btree.isBuild = (buildStats != NULL);
+	btree.payloadWidth = payloadWidth;
 	insertdata.items = items;
+	insertdata.payloads = payloadWidth > 0 ? payloads : NULL;
 	insertdata.nitem = nitem;
 	insertdata.curitem = 0;
 

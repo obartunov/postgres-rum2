@@ -47,6 +47,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/index_selfuncs.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -770,6 +771,8 @@ cursor_seek(Relation index, RginScanOpaque so, RginCursor *c, uint64 target)
 			cursor_load(so, c, BufferGetPage(c->buf), adv);
 			LockBuffer(c->buf, GIN_UNLOCK);
 		}
+		/* next leaf loaded and pinned, no lock held */
+		INJECTION_POINT("rgin-cursor-after-next-leaf", NULL);
 	}
 }
 
@@ -925,6 +928,8 @@ run_full(IndexScanDesc scan)
 		so->full[so->nfull].score = sum_score(so);
 		so->full[so->nfull].key = d;
 		so->nfull++;
+		if (so->nfull == 1)
+			INJECTION_POINT("rgin-full-after-first-doc", NULL);
 	}
 	for (int i = 0; i < nt; i++)
 		cursor_close(&cur[i]);
@@ -962,6 +967,8 @@ run_phase(IndexScanDesc scan)
 				t1;
 
 	INSTR_TIME_SET_CURRENT(t0);
+	if (j > 0)
+		INJECTION_POINT("rgin-c-before-phase", NULL);
 
 	for (int i = 0; i < nt; i++)
 		cursor_open(index, so, &cur[i], i);

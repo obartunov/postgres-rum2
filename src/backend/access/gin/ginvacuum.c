@@ -750,18 +750,19 @@ IndexBulkDeleteResult *
 ginbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			  IndexBulkDeleteCallback callback, void *callback_state)
 {
-	return ginbulkdeletePayload(info, stats, callback, callback_state, 0);
+	return ginbulkdeletePayload(info, stats, callback, callback_state, 0, NULL);
 }
 
 /*
  * Bulk delete for an index with posting payload width payloadWidth (0 for
  * ordinary GIN).  A posting and its payload are removed together; entry
- * tuple metadata is kept unchanged.
+ * tuple metadata is kept unchanged.  payloadOps are needed to move pending
+ * entries of a payload index into the main structure first.
  */
 IndexBulkDeleteResult *
 ginbulkdeletePayload(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 					 IndexBulkDeleteCallback callback, void *callback_state,
-					 int payloadWidth)
+					 int payloadWidth, const GinPayloadOps *payloadOps)
 {
 	Relation	index = info->index;
 	BlockNumber blkno = GIN_ROOT_BLKNO;
@@ -779,6 +780,7 @@ ginbulkdeletePayload(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	gvs.strategy = info->strategy;
 	initGinState(&gvs.ginstate, index);
 	gvs.ginstate.payloadWidth = payloadWidth;
+	gvs.ginstate.payloadOps = payloadOps;
 
 	/* first time through? */
 	if (stats == NULL)
@@ -893,6 +895,17 @@ ginbulkdeletePayload(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 IndexBulkDeleteResult *
 ginvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
+	return ginvacuumcleanupPayload(info, stats, 0, NULL);
+}
+
+/*
+ * ginvacuumcleanup for an index with posting payload width payloadWidth (0
+ * for ordinary GIN); payloadOps as for ginbulkdeletePayload.
+ */
+IndexBulkDeleteResult *
+ginvacuumcleanupPayload(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+						int payloadWidth, const GinPayloadOps *payloadOps)
+{
 	Relation	index = info->index;
 	bool		needLock;
 	BlockNumber npages,
@@ -912,6 +925,8 @@ ginvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 		if (info->is_autovacuum)
 		{
 			initGinState(&ginstate, index);
+			ginstate.payloadWidth = payloadWidth;
+			ginstate.payloadOps = payloadOps;
 			ginInsertCleanup(&ginstate, false, true, true, stats);
 		}
 		return stats;
@@ -925,6 +940,8 @@ ginvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	{
 		stats = palloc0_object(IndexBulkDeleteResult);
 		initGinState(&ginstate, index);
+		ginstate.payloadWidth = payloadWidth;
+		ginstate.payloadOps = payloadOps;
 		ginInsertCleanup(&ginstate, !info->is_autovacuum,
 						 false, true, stats);
 	}

@@ -45,6 +45,9 @@ typedef struct KeyArray
 {
 	Datum	   *keys;			/* expansible array */
 	GinNullCategory *categories;	/* another expansible array */
+	char	   *payloads;		/* payload index only: payloadWidth bytes per
+								 * entry */
+	int			payloadWidth;
 	int32		nvalues;		/* current number of valid entries */
 	int32		maxvalues;		/* allocated size of arrays */
 } KeyArray;
@@ -729,28 +732,51 @@ shiftList(Relation index, Buffer metabuffer, BlockNumber newHead,
 
 /* Initialize empty KeyArray */
 static void
-initKeyArray(KeyArray *keys, int32 maxvalues)
+initKeyArray(KeyArray *keys, int32 maxvalues, int payloadWidth)
 {
 	keys->keys = palloc_array(Datum, maxvalues);
 	keys->categories = palloc_array(GinNullCategory, maxvalues);
+	keys->payloadWidth = payloadWidth;
+	keys->payloads = payloadWidth > 0 ? palloc((Size) payloadWidth * maxvalues) : NULL;
 	keys->nvalues = 0;
 	keys->maxvalues = maxvalues;
 }
 
-/* Add datum to KeyArray, resizing if needed */
+/* Add datum (and its payload, for a payload index) to KeyArray, resizing if needed */
 static void
-addDatum(KeyArray *keys, Datum datum, GinNullCategory category)
+addDatum(KeyArray *keys, Datum datum, GinNullCategory category,
+		 const char *payload)
 {
 	if (keys->nvalues >= keys->maxvalues)
 	{
 		keys->maxvalues *= 2;
 		keys->keys = repalloc_array(keys->keys, Datum, keys->maxvalues);
 		keys->categories = repalloc_array(keys->categories, GinNullCategory, keys->maxvalues);
+		if (keys->payloadWidth > 0)
+			keys->payloads = repalloc(keys->payloads,
+									  (Size) keys->payloadWidth * keys->maxvalues);
 	}
 
 	keys->keys[keys->nvalues] = datum;
 	keys->categories[keys->nvalues] = category;
+	if (keys->payloadWidth > 0)
+		memcpy(keys->payloads + (Size) keys->nvalues * keys->payloadWidth,
+			   payload, keys->payloadWidth);
 	keys->nvalues++;
+}
+
+/* Add the keys collected in ka for one heap row and column to accum */
+static void
+insertKeyArray(BuildAccumulator *accum, KeyArray *ka,
+			   ItemPointer heapptr, OffsetNumber attrnum)
+{
+	if (ka->payloadWidth > 0)
+		ginInsertBAEntriesPayload(accum, heapptr, attrnum,
+								  ka->keys, ka->categories, ka->payloads,
+								  ka->nvalues);
+	else
+		ginInsertBAEntries(accum, heapptr, attrnum,
+						   ka->keys, ka->categories, ka->nvalues);
 }
 
 /*
@@ -802,8 +828,7 @@ processPendingPage(BuildAccumulator *accum, KeyArray *ka,
 			 * for one heap tuple and one column.  So call it at a boundary,
 			 * and reset ka.
 			 */
-			ginInsertBAEntries(accum, &heapptr, attrnum,
-							   ka->keys, ka->categories, ka->nvalues);
+			insertKeyArray(accum, ka, &heapptr, attrnum);
 			ka->nvalues = 0;
 			heapptr = itup->t_tid;
 			attrnum = curattnum;
@@ -811,12 +836,54 @@ processPendingPage(BuildAccumulator *accum, KeyArray *ka,
 
 		/* Add key to KeyArray */
 		curkey = gintuple_get_key(accum->ginstate, itup, &curcategory);
-		addDatum(ka, curkey, curcategory);
+		addDatum(ka, curkey, curcategory,
+				 ka->payloadWidth > 0 ?
+				 GinPendingTupleGetPayload(itup, ka->payloadWidth) : NULL);
 	}
 
 	/* Dump out all remaining keys */
-	ginInsertBAEntries(accum, &heapptr, attrnum,
-					   ka->keys, ka->categories, ka->nvalues);
+	insertKeyArray(accum, ka, &heapptr, attrnum);
+}
+
+/*
+ * Move the accumulated entries into the regular structure.  A payload index
+ * goes through ginEntryInsertPayload, the same path as a direct insertion,
+ * so a posting-tree key's metadata is widened before the postings reach the
+ * tree.  The pending copies are removed only after this returns.
+ */
+static void
+flushAccumulator(GinState *ginstate, BuildAccumulator *accum, bool delay)
+{
+	ItemPointerData *list;
+	char	   *payloads;
+	uint32		nlist;
+	Datum		key;
+	GinNullCategory category;
+	OffsetNumber attnum;
+
+	ginBeginBAScan(accum);
+	if (ginstate->payloadWidth > 0)
+	{
+		while ((list = ginGetBAEntryPayload(accum, &attnum, &key, &category,
+											&nlist, &payloads)) != NULL)
+		{
+			ginEntryInsertPayload(ginstate, attnum, key, category,
+								  list, payloads, nlist, NULL);
+			if (delay)
+				vacuum_delay_point(false);
+		}
+	}
+	else
+	{
+		while ((list = ginGetBAEntry(accum,
+									 &attnum, &key, &category, &nlist)) != NULL)
+		{
+			ginEntryInsert(ginstate, attnum, key, category,
+						   list, nlist, NULL);
+			if (delay)
+				vacuum_delay_point(false);
+		}
+	}
 }
 
 /*
@@ -900,6 +967,14 @@ ginInsertCleanup(GinState *ginstate, bool must_empty_list,
 	}
 
 	/*
+	 * Pending tuples of a payload index carry payloads that only a GinState
+	 * with the payload hooks can move to the main structure.
+	 */
+	if ((metadata->ginVersion == GIN_PAYLOAD_VERSION) != (ginstate->payloadWidth > 0))
+		elog(ERROR, "GIN pending list of index \"%s\" cannot be cleaned up without its payload hooks",
+			 RelationGetRelationName(index));
+
+	/*
 	 * Remember a tail page to prevent infinite cleanup if other backends add
 	 * new tuples faster than we can cleanup.
 	 */
@@ -924,7 +999,7 @@ ginInsertCleanup(GinState *ginstate, bool must_empty_list,
 
 	oldCtx = MemoryContextSwitchTo(opCtx);
 
-	initKeyArray(&datums, 128);
+	initKeyArray(&datums, 128, ginstate->payloadWidth);
 	ginInitBA(&accum);
 	accum.ginstate = ginstate;
 
@@ -963,12 +1038,7 @@ ginInsertCleanup(GinState *ginstate, bool must_empty_list,
 			(GinPageHasFullRow(page) &&
 			 accum.allocatedMemory >= workMemory * (Size) 1024))
 		{
-			ItemPointerData *list;
-			uint32		nlist;
-			Datum		key;
-			GinNullCategory category;
-			OffsetNumber maxoff,
-						attnum;
+			OffsetNumber maxoff;
 
 			/*
 			 * Unlock current page to increase performance. Changes of page
@@ -983,14 +1053,7 @@ ginInsertCleanup(GinState *ginstate, bool must_empty_list,
 			 * significant amount of time - so, run it without locking pending
 			 * list.
 			 */
-			ginBeginBAScan(&accum);
-			while ((list = ginGetBAEntry(&accum,
-										 &attnum, &key, &category, &nlist)) != NULL)
-			{
-				ginEntryInsert(ginstate, attnum, key, category,
-							   list, nlist, NULL);
-				vacuum_delay_point(false);
-			}
+			flushAccumulator(ginstate, &accum, true);
 
 			/*
 			 * Lock the whole list to remove pages
@@ -1012,12 +1075,7 @@ ginInsertCleanup(GinState *ginstate, bool must_empty_list,
 			{
 				ginInitBA(&accum);
 				processPendingPage(&accum, &datums, page, maxoff + 1);
-
-				ginBeginBAScan(&accum);
-				while ((list = ginGetBAEntry(&accum,
-											 &attnum, &key, &category, &nlist)) != NULL)
-					ginEntryInsert(ginstate, attnum, key, category,
-								   list, nlist, NULL);
+				flushAccumulator(ginstate, &accum, false);
 			}
 
 			/*
@@ -1050,7 +1108,7 @@ ginInsertCleanup(GinState *ginstate, bool must_empty_list,
 			 * release memory used so far and reinit state
 			 */
 			MemoryContextReset(opCtx);
-			initKeyArray(&datums, datums.maxvalues);
+			initKeyArray(&datums, datums.maxvalues, ginstate->payloadWidth);
 			ginInitBA(&accum);
 		}
 		else

@@ -528,7 +528,12 @@ extern IndexBulkDeleteResult *ginbulkdeletePayload(IndexVacuumInfo *info,
 												   IndexBulkDeleteResult *stats,
 												   IndexBulkDeleteCallback callback,
 												   void *callback_state,
-												   int payloadWidth);
+												   int payloadWidth,
+												   const GinPayloadOps *payloadOps);
+extern IndexBulkDeleteResult *ginvacuumcleanupPayload(IndexVacuumInfo *info,
+													  IndexBulkDeleteResult *stats,
+													  int payloadWidth,
+													  const GinPayloadOps *payloadOps);
 extern ItemPointer ginVacuumItemPointersPayload(GinVacuumState *gvs,
 												ItemPointerData *items, char *payloads,
 												int payloadWidth, int nitem,

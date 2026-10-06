@@ -517,7 +517,8 @@ rginbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * kept as is, so the frontier may become wider than the remaining
 	 * postings, which keeps the bound safe.
 	 */
-	return ginbulkdeletePayload(info, stats, callback, callback_state, W);
+	return ginbulkdeletePayload(info, stats, callback, callback_state, W,
+								&rgin_bm25_payload_ops);
 }
 
 /* ---------------------------------------------------------------- posting cursor */

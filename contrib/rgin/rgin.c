@@ -43,6 +43,7 @@
 #include "portability/instr_time.h"
 #include "storage/bufmgr.h"
 #include "tsearch/ts_type.h"
+#include "tsearch/ts_utils.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -246,6 +247,11 @@ typedef struct RginStats
 	int64		emitted;
 	bool		fallback;
 	int64		full_docs;
+	int64		pending_pages;	/* pending list: pages read */
+	int64		pending_rows;	/* heap rows read */
+	int64		pending_docs;	/* rows matching the query: exact candidates */
+	int64		pending_dups;	/* main postings skipped as already pending */
+	int64		pending_bytes;	/* memory of the pending candidate set */
 	double		full_merge_ms;	/* FULL: cursor merge + scoring */
 	double		full_sort_ms;	/* FULL: heapify of all scored docs */
 	double		phase_ms;		/* C: time inside phases */
@@ -568,6 +574,11 @@ typedef struct RginScanOpaqueData
 	int64		nfull;
 	double	   *contrib;
 	bool	   *has;
+	/* exact candidates from the pending list, sorted by key */
+	int64		npend;
+	uint64	   *pendkey;
+	double	   *pendscore;
+	RginPayload *pendpl;		/* npend x nterms, 0 = term absent */
 	RginStats	st;
 } RginScanOpaqueData;
 
@@ -878,6 +889,276 @@ sum_score(RginScanOpaque so)
 	return s;
 }
 
+/* ---------------------------------------------------------------- pending list */
+
+/*
+ * The pending list is read first and completely, before any root metadata
+ * or posting of the main structure (as gingetbitmap does).  A posting that
+ * the scan does not find here was moved to the main structure and its
+ * pending page deleted before the scan read the list head: ginInsertCleanup
+ * inserts into the main structure (widening a tree key's root metadata
+ * first) before shiftList, and shiftList takes the metapage exclusively.
+ * So every bound and posting read afterwards covers it.  A posting found
+ * here may be met again in the main structure if cleanup moves it meanwhile;
+ * the main scan skips keys of this set.
+ *
+ * Rows found here are exact: all their pending tuples are read, so a row's
+ * score is complete whatever terms it has.
+ */
+typedef struct PendRow
+{
+	uint64		key;
+	RginPayload *pl;			/* nterms, 0 = absent */
+	bool		match;
+} PendRow;
+
+static int
+query_term_index(RginQuery *q, Datum key)
+{
+	text	   *t = DatumGetTextPP(key);
+	char	   *lex = VARDATA_ANY(t);
+	int			len = VARSIZE_ANY_EXHDR(t);
+	int			lo = 0,
+				hi = q->nterms - 1;
+
+	while (lo <= hi)
+	{
+		int			mid = (lo + hi) / 2;
+		int			c = tsCompareString(RGIN_QUERY_LEXEME(q, mid), q->terms[mid].len,
+										lex, len, false);
+
+		if (c == 0)
+			return mid;
+		if (c < 0)
+			lo = mid + 1;
+		else
+			hi = mid - 1;
+	}
+	return -1;
+}
+
+static void
+pend_add(RginScanOpaque so, PendRow *row, int64 *cap)
+{
+	RginQuery  *q = so->q;
+	int			nt = q->nterms;
+	double		s = 0.0;
+
+	if (so->npend == *cap)
+	{
+		*cap = Max(64, *cap * 2);
+		so->pendkey = so->pendkey ? repalloc_huge(so->pendkey, sizeof(uint64) * *cap)
+			: MemoryContextAllocHuge(so->ctx, sizeof(uint64) * *cap);
+		so->pendscore = so->pendscore ? repalloc_huge(so->pendscore, sizeof(double) * *cap)
+			: MemoryContextAllocHuge(so->ctx, sizeof(double) * *cap);
+		so->pendpl = so->pendpl ? repalloc_huge(so->pendpl, sizeof(RginPayload) * nt * *cap)
+			: MemoryContextAllocHuge(so->ctx, sizeof(RginPayload) * nt * *cap);
+	}
+	/* same summation order as sum_score(), so the score is bit-identical */
+	for (int i = 0; i < nt; i++)
+		if (row->pl[i] != 0)
+			s += rgin_contrib(row->pl[i], q->terms[i].idf, q);
+	so->pendkey[so->npend] = row->key;
+	so->pendscore[so->npend] = s;
+	memcpy(so->pendpl + so->npend * nt, row->pl, sizeof(RginPayload) * nt);
+	so->npend++;
+	so->st.pending_docs++;
+}
+
+static int
+pend_cmp(const void *a, const void *b, void *arg)
+{
+	uint64	   *k = arg;
+	uint64		x = k[*(const int64 *) a],
+				y = k[*(const int64 *) b];
+
+	return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+/* sort the candidate set by key and check that each heap TID occurs once */
+static void
+pend_finish(RginScanOpaque so)
+{
+	int			nt = so->q->nterms;
+	int64		n = so->npend;
+	int64	   *perm;
+	uint64	   *key;
+	double	   *score;
+	RginPayload *pl;
+	int64		m = 0;
+
+	if (n == 0)
+		return;
+	perm = palloc(sizeof(int64) * n);
+	for (int64 i = 0; i < n; i++)
+		perm[i] = i;
+	qsort_arg(perm, n, sizeof(int64), pend_cmp, so->pendkey);
+	key = MemoryContextAllocHuge(so->ctx, sizeof(uint64) * n);
+	score = MemoryContextAllocHuge(so->ctx, sizeof(double) * n);
+	pl = MemoryContextAllocHuge(so->ctx, sizeof(RginPayload) * nt * n);
+	for (int64 i = 0; i < n; i++)
+	{
+		int64		j = perm[i];
+
+		if (m > 0 && key[m - 1] == so->pendkey[j])
+		{
+			if (memcmp(pl + (m - 1) * nt, so->pendpl + j * nt, sizeof(RginPayload) * nt) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("rgin: heap TID (%u,%u) occurs twice in the pending list with different payloads",
+								(unsigned) (key[m - 1] >> 16), (unsigned) (key[m - 1] & 0xffff))));
+			continue;
+		}
+		key[m] = so->pendkey[j];
+		score[m] = so->pendscore[j];
+		memcpy(pl + m * nt, so->pendpl + j * nt, sizeof(RginPayload) * nt);
+		m++;
+	}
+	pfree(perm);
+	pfree(so->pendkey);
+	pfree(so->pendscore);
+	pfree(so->pendpl);
+	so->pendkey = key;
+	so->pendscore = score;
+	so->pendpl = pl;
+	so->npend = m;
+	so->st.pending_bytes = m * (int64) (sizeof(uint64) + sizeof(double) + sizeof(RginPayload) * nt);
+}
+
+static void
+scan_pending(IndexScanDesc scan)
+{
+	RginScanOpaque so = (RginScanOpaque) scan->opaque;
+	Relation	index = scan->indexRelation;
+	RginQuery  *q = so->q;
+	int			nt = q->nterms;
+	Buffer		metabuffer,
+				buf;
+	Page		page;
+	BlockNumber blkno;
+	PendRow		row;
+	int64		cap = 0;
+
+	so->npend = 0;
+	metabuffer = ReadBuffer(index, GIN_METAPAGE_BLKNO);
+	LockBuffer(metabuffer, GIN_SHARE);
+	blkno = GinPageGetMeta(BufferGetPage(metabuffer))->head;
+	if (blkno == InvalidBlockNumber)
+	{
+		UnlockReleaseBuffer(metabuffer);
+		return;
+	}
+
+	/* lock the head before releasing the metapage, as scanPendingInsert */
+	buf = ReadBuffer(index, blkno);
+	LockBuffer(buf, GIN_SHARE);
+	UnlockReleaseBuffer(metabuffer);
+
+	row.key = PG_UINT64_MAX;
+	row.pl = palloc0(sizeof(RginPayload) * nt);
+	row.match = false;
+	for (;;)
+	{
+		OffsetNumber maxoff;
+
+		page = BufferGetPage(buf);
+		if (!GinPageIsList(page) || GinPageIsDeleted(page))
+			elog(ERROR, "rgin: unexpected page %u in the pending list of \"%s\"",
+				 BufferGetBlockNumber(buf), RelationGetRelationName(index));
+		so->st.pending_pages++;
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			IndexTuple	itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, off));
+			uint64		k = tid_key(&itup->t_tid);
+			GinNullCategory cat;
+			Datum		key;
+			int			t;
+
+			if (k != row.key)
+			{
+				/* a heap row's tuples are consecutive, possibly over pages */
+				if (row.match)
+					pend_add(so, &row, &cap);
+				row.key = k;
+				memset(row.pl, 0, sizeof(RginPayload) * nt);
+				row.match = false;
+				so->st.pending_rows++;
+			}
+			key = gintuple_get_key(&so->gs, itup, &cat);
+			if (cat != GIN_CAT_NORM_KEY)
+				continue;
+			t = query_term_index(q, key);
+			if (t >= 0)
+			{
+				RginPayload p = rgin_payload_get(GinPendingTupleGetPayload(itup, W));
+
+				if (p == 0)
+					elog(ERROR, "rgin: zero payload in the pending list of \"%s\"",
+						 RelationGetRelationName(index));
+				row.pl[t] = p;
+				row.match = true;
+			}
+		}
+		blkno = GinPageGetOpaque(page)->rightlink;
+		if (blkno == InvalidBlockNumber)
+			break;
+
+		/*
+		 * Lock the next page before releasing this one, so that cleanup
+		 * (shiftList deletes a prefix of the list) cannot get past us.
+		 */
+		{
+			Buffer		next = ReadBuffer(index, blkno);
+
+			LockBuffer(next, GIN_SHARE);
+			UnlockReleaseBuffer(buf);
+			buf = next;
+		}
+	}
+	UnlockReleaseBuffer(buf);
+	if (row.match)
+		pend_add(so, &row, &cap);
+	pfree(row.pl);
+	pend_finish(so);
+}
+
+/* index of key in the pending candidate set, or -1 */
+static int64
+pend_find(RginScanOpaque so, uint64 key)
+{
+	int64		lo = 0,
+				hi = so->npend - 1;
+
+	while (lo <= hi)
+	{
+		int64		mid = (lo + hi) / 2;
+
+		if (so->pendkey[mid] == key)
+			return mid;
+		if (so->pendkey[mid] < key)
+			lo = mid + 1;
+		else
+			hi = mid - 1;
+	}
+	return -1;
+}
+
+/*
+ * A main posting of term t for a document that is also pending: cleanup has
+ * moved (part of) it meanwhile.  Same key and TID must carry the same
+ * payload.
+ */
+static void
+pend_check_dup(RginScanOpaque so, int64 pi, int t, RginPayload p, uint64 key)
+{
+	if (so->pendpl[pi * so->q->nterms + t] != p)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("rgin: payload of heap TID (%u,%u) differs between the pending list and the main index",
+						(unsigned) (key >> 16), (unsigned) (key & 0xffff))));
+}
+
 /* ---------------------------------------------------------------- FULL */
 
 static void
@@ -903,6 +1184,7 @@ run_full(IndexScanDesc scan)
 	for (;;)
 	{
 		uint64		d = PG_UINT64_MAX;
+		int64		pi;
 
 		CHECK_FOR_INTERRUPTS();
 		for (int i = 0; i < nt; i++)
@@ -910,16 +1192,28 @@ run_full(IndexScanDesc scan)
 				d = Min(d, cursor_key(&cur[i]));
 		if (d == PG_UINT64_MAX)
 			break;
+		pi = pend_find(so, d);
 		for (int i = 0; i < nt; i++)
 		{
 			so->has[i] = false;
 			if (valid[i] && cursor_key(&cur[i]) == d)
 			{
 				so->has[i] = true;
-				so->contrib[i] = rgin_contrib(cursor_payload(&cur[i]), q->terms[i].idf, q);
-				so->st.contribs++;
+				if (pi >= 0)
+					pend_check_dup(so, pi, i, cursor_payload(&cur[i]), d);
+				else
+				{
+					so->contrib[i] = rgin_contrib(cursor_payload(&cur[i]), q->terms[i].idf, q);
+					so->st.contribs++;
+				}
 				valid[i] = cursor_seek(scan->indexRelation, so, &cur[i], d + 1);
 			}
+		}
+		if (pi >= 0)
+		{
+			/* exact from the pending list, added below */
+			so->st.pending_dups++;
+			continue;
 		}
 		if (so->nfull == cap)
 		{
@@ -934,6 +1228,17 @@ run_full(IndexScanDesc scan)
 	}
 	for (int i = 0; i < nt; i++)
 		cursor_close(&cur[i]);
+	for (int64 i = 0; i < so->npend; i++)
+	{
+		if (so->nfull == cap)
+		{
+			cap *= 2;
+			so->full = repalloc_huge(so->full, sizeof(PoolEntry) * cap);
+		}
+		so->full[so->nfull].score = so->pendscore[i];
+		so->full[so->nfull].key = so->pendkey[i];
+		so->nfull++;
+	}
 	INSTR_TIME_SET_CURRENT(t1);
 	INSTR_TIME_SUBTRACT(t1, t0);
 	so->st.full_merge_ms += INSTR_TIME_GET_MILLISEC(t1);
@@ -970,6 +1275,9 @@ run_phase(IndexScanDesc scan)
 	INSTR_TIME_SET_CURRENT(t0);
 	if (j > 0)
 		INJECTION_POINT("rgin-c-before-phase", NULL);
+	/* the pending candidates alone may exceed the pool limit */
+	if (so->poolcap * (int64) sizeof(PoolEntry) > limit)
+		return false;
 
 	for (int i = 0; i < nt; i++)
 		cursor_open(index, so, &cur[i], i);
@@ -978,8 +1286,16 @@ run_phase(IndexScanDesc scan)
 	{
 		uint64		d = cursor_key(&cur[T]);
 		bool		seen = false;
+		int64		pi = pend_find(so, d);
 
 		CHECK_FOR_INTERRUPTS();
+		/* documents read from the pending list are exact and in the pool */
+		if (pi >= 0)
+		{
+			pend_check_dup(so, pi, T, cursor_payload(&cur[T]), d);
+			so->st.pending_dups++;
+			seen = true;
+		}
 		/* documents containing an earlier-phase term are already exact */
 		for (int e = 0; e < j && !seen; e++)
 		{
@@ -1175,6 +1491,14 @@ rginrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	so->ub = palloc0(sizeof(double) * Max(q->nterms, 1));
 	so->order = palloc0(sizeof(int) * Max(q->nterms, 1));
 
+	/* pending list first, before any root bound or posting is read */
+	so->npend = 0;
+	so->pendkey = NULL;
+	so->pendscore = NULL;
+	so->pendpl = NULL;
+	if (!so->empty && q->nterms > 0)
+		scan_pending(scan);
+
 	so->strategy = rgin_strategy;
 	if (so->strategy == RGIN_STRATEGY_AUTO)
 		so->strategy = (q->nterms <= 2) ? RGIN_STRATEGY_C : RGIN_STRATEGY_FULL;
@@ -1194,6 +1518,9 @@ rginrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 		so->D = 0.0;
 		for (int i = 0; i < q->nterms; i++)
 			so->D += so->ub[so->order[i]];
+		/* exact pending candidates seed the pool; phases cover main only */
+		for (int64 i = 0; i < so->npend; i++)
+			pool_push(so, so->pendscore[i], so->pendkey[i]);
 	}
 	MemoryContextSwitchTo(old);
 }
@@ -1437,13 +1764,18 @@ rgin_last_stats(PG_FUNCTION_ARGS)
 					 ",\"bound_evals\":" INT64_FORMAT ",\"pool_peak\":" INT64_FORMAT
 					 ",\"pool_peak_bytes\":" INT64_FORMAT ",\"emitted\":" INT64_FORMAT
 					 ",\"fallback\":%s,\"full_docs\":" INT64_FORMAT
+					 ",\"pending_pages\":" INT64_FORMAT ",\"pending_rows\":" INT64_FORMAT
+					 ",\"pending_docs\":" INT64_FORMAT ",\"pending_dups\":" INT64_FORMAT
+					 ",\"pending_bytes\":" INT64_FORMAT
 					 ",\"full_merge_ms\":%.3f,\"full_sort_ms\":%.3f,\"phase_ms\":%.3f}",
 					 st->strategy ? st->strategy : "", st->decode ? st->decode : "",
 					 st->nterms, st->phases,
 					 st->postings, st->segments, st->leaf_pages, st->descents, st->seeks,
 					 st->docs_scored, st->contribs, st->bound_evals, st->pool_peak,
 					 st->pool_peak_bytes, st->emitted, st->fallback ? "true" : "false",
-					 st->full_docs, st->full_merge_ms, st->full_sort_ms, st->phase_ms);
+					 st->full_docs, st->pending_pages, st->pending_rows, st->pending_docs,
+					 st->pending_dups, st->pending_bytes,
+					 st->full_merge_ms, st->full_sort_ms, st->phase_ms);
 	PG_RETURN_TEXT_P(cstring_to_text(s.data));
 }
 

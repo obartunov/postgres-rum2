@@ -19,8 +19,8 @@
  *	   phases over terms by decreasing root bound, nothing discarded).
  *
  * Research-only restrictions: fastupdate=off, single-column, serial build,
- * no bitmap scans, no bulk delete (VACUUM with dead tuples errors out), no
- * partial match, append-only.
+ * no bitmap scans, no partial match.  Bulk delete removes postings with
+ * their payloads and keeps entry metadata (bounds stay safe, stale-high).
  */
 #include "postgres.h"
 
@@ -39,6 +39,7 @@
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "nodes/pathnodes.h"
+#include "port/pg_crc32c.h"
 #include "portability/instr_time.h"
 #include "storage/bufmgr.h"
 #include "tsearch/ts_type.h"
@@ -502,15 +503,20 @@ static IndexBulkDeleteResult *
 rginbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			   IndexBulkDeleteCallback callback, void *callback_state)
 {
+	GinMetaPageExt ext;
+
+	if (!ginGetMetaExt(info->index, &ext) || ext.payloadWidth != W)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" does not have the rgin payload format; REINDEX it",
+						RelationGetRelationName(info->index))));
+
 	/*
-	 * Temporary development guard.  The format removes a payload together
-	 * with its posting, but posting-tree and entry vacuum are not yet made
-	 * payload- and metadata-aware (ginvacuum.c would drop entry metadata).
+	 * Postings die with their payloads; entry metadata (df_G, frontier) is
+	 * kept as is, so the frontier may become wider than the remaining
+	 * postings, which keeps the bound safe.
 	 */
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("rgin research prototype is append-only: bulk delete is not supported")));
-	return NULL;
+	return ginbulkdeletePayload(info, stats, callback, callback_state, W);
 }
 
 /* ---------------------------------------------------------------- posting cursor */
@@ -1536,7 +1542,25 @@ typedef struct CheckCounters
 	int64		order_violations;
 	int64		bound_violations;
 	int64		tree_without_frontier;
+	int64		segment_violations;
+	int64		empty_tree_keys;
+	int64		empty_inline_keys;
+	pg_crc32c	meta_crc;
 } CheckCounters;
+
+/*
+ * Structure of one payload segment: item count >= 1, payload area of
+ * exactly nitems * W bytes after the TID stream, and a TID stream length
+ * possible for nitems - 1 varbyte deltas.
+ */
+static bool
+segment_ok(GinPostingList *seg)
+{
+	int			n = GinPayloadListGetNItems(seg);
+	int			tidbytes = (int) seg->nbytes - (int) sizeof(uint16) - n * W;
+
+	return n >= 1 && tidbytes >= n - 1 && tidbytes <= 7 * (n - 1);
+}
 
 static bool
 covered(const RginMeta *m, RginPayload p)
@@ -1580,9 +1604,15 @@ check_tree(Relation index, BlockNumber root, const RginMeta *m, CheckCounters *c
 		{
 			int			n;
 			char	   *pl;
-			ItemPointer items = ginPostingListDecodePayload(seg, W, &n, &pl);
+			ItemPointer items;
 
 			cc->segments++;
+			if (!segment_ok(seg))
+			{
+				cc->segment_violations++;
+				continue;
+			}
+			items = ginPostingListDecodePayload(seg, W, &n, &pl);
 			for (int i = 0; i < n; i++)
 			{
 				uint64		k = tid_key(&items[i]);
@@ -1617,6 +1647,7 @@ rgin_check(PG_FUNCTION_ARGS)
 	StringInfoData s;
 
 	memset(&cc, 0, sizeof(cc));
+	INIT_CRC32C(cc.meta_crc);
 	for (;;)
 	{
 		BlockNumber blk = levelStart;
@@ -1653,6 +1684,18 @@ rgin_check(PG_FUNCTION_ARGS)
 					RginMeta	m;
 
 					rgin_meta_parse(meta, metalen, &m);
+					{
+						GinNullCategory cat;
+						Datum		key = gintuple_get_key(&gs, itup, &cat);
+						uint16		ml = metalen;
+
+						if (cat == GIN_CAT_NORM_KEY)
+							COMP_CRC32C(cc.meta_crc, VARDATA_ANY(DatumGetPointer(key)),
+										VARSIZE_ANY_EXHDR(DatumGetPointer(key)));
+						COMP_CRC32C(cc.meta_crc, &ml, sizeof(ml));
+						if (metalen > 0)
+							COMP_CRC32C(cc.meta_crc, meta, metalen);
+					}
 					cc.leaf_tuples++;
 					cc.meta_bytes += metalen;
 					cc.frontier_points += m.npoints;
@@ -1660,10 +1703,14 @@ rgin_check(PG_FUNCTION_ARGS)
 						cc.keys_with_static++;
 					if (GinIsPostingTree(itup))
 					{
+						int64		before = cc.postings;
+
 						cc.tree_keys++;
 						if (m.npoints == 0)
 							cc.tree_without_frontier++;
 						check_tree(index, GinGetPostingTree(itup), &m, &cc);
+						if (cc.postings == before)
+							cc.empty_tree_keys++;
 					}
 					else
 					{
@@ -1672,6 +1719,16 @@ rgin_check(PG_FUNCTION_ARGS)
 						ItemPointer items;
 
 						cc.inline_keys++;
+						if (GinGetNPosting(itup) == 0)
+						{
+							cc.empty_inline_keys++;
+							continue;
+						}
+						if (!segment_ok((GinPostingList *) GinGetPosting(itup)))
+						{
+							cc.segment_violations++;
+							continue;
+						}
 						items = ginReadTuplePayload(&gs, FirstOffsetNumber, itup, &n, &pl);
 						for (int i = 1; i < n; i++)
 							if (tid_key(&items[i]) <= tid_key(&items[i - 1]))
@@ -1688,6 +1745,7 @@ rgin_check(PG_FUNCTION_ARGS)
 		levelStart = firstChild;
 	}
 	index_close(index, NoLock);
+	FIN_CRC32C(cc.meta_crc);
 
 	initStringInfo(&s);
 	appendStringInfo(&s,
@@ -1698,12 +1756,15 @@ rgin_check(PG_FUNCTION_ARGS)
 					 ",\"frontier_points\":" INT64_FORMAT ",\"postings\":" INT64_FORMAT
 					 ",\"data_leaf_pages\":" INT64_FORMAT ",\"segments\":" INT64_FORMAT
 					 ",\"order_violations\":" INT64_FORMAT ",\"bound_violations\":" INT64_FORMAT
-					 ",\"tree_without_frontier\":" INT64_FORMAT "}",
+					 ",\"tree_without_frontier\":" INT64_FORMAT
+					 ",\"segment_violations\":" INT64_FORMAT ",\"empty_tree_keys\":" INT64_FORMAT
+					 ",\"empty_inline_keys\":" INT64_FORMAT ",\"meta_crc\":\"%08x\"}",
 					 cc.entry_pages, cc.interior_tuples, cc.interior_with_meta,
 					 cc.leaf_tuples, cc.tree_keys, cc.inline_keys, cc.keys_with_static,
 					 cc.meta_bytes, cc.frontier_points, cc.postings, cc.data_leaf_pages,
 					 cc.segments, cc.order_violations, cc.bound_violations,
-					 cc.tree_without_frontier);
+					 cc.tree_without_frontier, cc.segment_violations, cc.empty_tree_keys,
+					 cc.empty_inline_keys, (unsigned) cc.meta_crc);
 	PG_RETURN_TEXT_P(cstring_to_text(s.data));
 }
 
@@ -1734,6 +1795,71 @@ rgin_debug_insert(PG_FUNCTION_ARGS)
 								  GIN_CAT_NORM_KEY, tid, payload, 1, NULL);
 	index_close(index, NoLock);
 	PG_RETURN_INT32(flags);
+}
+
+/*
+ * rgin_term_segments(index, lexeme): physical layout of a key's postings as
+ * JSON: {"inline": n} or {"pages": [[blkno, [nitems, ...]], ...]}.
+ */
+PG_FUNCTION_INFO_V1(rgin_term_segments);
+
+Datum
+rgin_term_segments(PG_FUNCTION_ARGS)
+{
+	text	   *lex = PG_GETARG_TEXT_PP(1);
+	GinState	gs;
+	Relation	index = open_rgin(PG_GETARG_OID(0), &gs);
+	RginTermInfo ti;
+	StringInfoData s;
+
+	rgin_lookup_term(index, &gs, VARDATA_ANY(lex), VARSIZE_ANY_EXHDR(lex), false, &ti);
+	initStringInfo(&s);
+	if (!ti.found)
+		appendStringInfoString(&s, "null");
+	else if (!ti.isTree)
+		appendStringInfo(&s, "{\"inline\":%d}", ti.nitems);
+	else
+	{
+		Buffer		buf = ReadBuffer(index, ti.root);
+		bool		first = true;
+
+		LockBuffer(buf, GIN_SHARE);
+		while (!GinPageIsLeaf(BufferGetPage(buf)))
+		{
+			BlockNumber child = PostingItemGetBlockNumber(GinDataPageGetPostingItem(BufferGetPage(buf),
+																				   FirstOffsetNumber));
+
+			UnlockReleaseBuffer(buf);
+			buf = ReadBuffer(index, child);
+			LockBuffer(buf, GIN_SHARE);
+		}
+		appendStringInfoString(&s, "{\"pages\":[");
+		for (;;)
+		{
+			Page		page = BufferGetPage(buf);
+			char	   *endptr;
+			ItemPointerData inv;
+			GinPostingList *seg;
+			BlockNumber next;
+
+			ItemPointerSetInvalid(&inv);
+			seg = GinDataLeafPageFindSegment(page, inv, &endptr);
+			appendStringInfo(&s, "%s[%u,[", first ? "" : ",", BufferGetBlockNumber(buf));
+			first = false;
+			for (bool f2 = true; seg && (char *) seg < endptr; seg = GinNextPostingListSegment(seg), f2 = false)
+				appendStringInfo(&s, "%s%d", f2 ? "" : ",", GinPayloadListGetNItems(seg));
+			appendStringInfoString(&s, "]]");
+			next = GinPageGetOpaque(page)->rightlink;
+			UnlockReleaseBuffer(buf);
+			if (next == InvalidBlockNumber)
+				break;
+			buf = ReadBuffer(index, next);
+			LockBuffer(buf, GIN_SHARE);
+		}
+		appendStringInfoString(&s, "]}");
+	}
+	index_close(index, NoLock);
+	PG_RETURN_TEXT_P(cstring_to_text(s.data));
 }
 
 void

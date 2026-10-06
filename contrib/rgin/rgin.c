@@ -1074,6 +1074,7 @@ scan_pending(IndexScanDesc scan)
 	int64		cap = 0;
 
 	so->npend = 0;
+	INJECTION_POINT("rgin-pending-before-head", NULL);
 	metabuffer = ReadBuffer(index, GIN_METAPAGE_BLKNO);
 	LockBuffer(metabuffer, GIN_SHARE);
 	blkno = GinPageGetMeta(BufferGetPage(metabuffer))->head;
@@ -1113,7 +1114,12 @@ scan_pending(IndexScanDesc scan)
 			{
 				/* a heap row's tuples are consecutive, possibly over pages */
 				if (row.match)
+				{
 					pend_add(so, &row, &cap);
+					/* the pending page is share-locked here */
+					if (so->npend == 1)
+						INJECTION_POINT("rgin-pending-after-row", NULL);
+				}
 				row.key = k;
 				memset(row.pl, 0, sizeof(RginPayload) * nt);
 				row.match = false;
@@ -1155,6 +1161,7 @@ scan_pending(IndexScanDesc scan)
 		pend_add(so, &row, &cap);
 	pfree(row.pl);
 	pend_finish(so);
+	INJECTION_POINT("rgin-pending-done", NULL);
 }
 
 /* index of key in the pending candidate set, or -1 */
@@ -1629,7 +1636,11 @@ rgingettuple(IndexScanDesc scan, ScanDirection dir)
 		if (so->in_full)
 		{
 			if (so->nfull > 0)
+			{
+				if (so->st.emitted == 0)
+					INJECTION_POINT("rgin-before-emit", NULL);
 				result = emit(scan, heap_pop(so->full, &so->nfull));
+			}
 			break;
 		}
 		if (so->npool > 0)
@@ -1641,6 +1652,8 @@ rgingettuple(IndexScanDesc scan, ScanDirection dir)
 			if (so->phases_done == nt ||
 				so->pool[0].score > D + fabs(D) * 1e-12 * (nt + 1))
 			{
+				if (so->st.emitted == 0)
+					INJECTION_POINT("rgin-before-emit", NULL);
 				result = emit(scan, pool_pop(so));
 				break;
 			}

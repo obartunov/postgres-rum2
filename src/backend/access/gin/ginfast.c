@@ -32,6 +32,7 @@
 #include "storage/predicate.h"
 #include "utils/acl.h"
 #include "utils/fmgrprotos.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -1055,6 +1056,9 @@ ginInsertCleanup(GinState *ginstate, bool must_empty_list,
 			 */
 			flushAccumulator(ginstate, &accum, true);
 
+			/* postings are in the main structure, pending copies still there */
+			INJECTION_POINT("gin-cleanup-before-shift", NULL);
+
 			/*
 			 * Lock the whole list to remove pages
 			 */
@@ -1096,6 +1100,7 @@ ginInsertCleanup(GinState *ginstate, bool must_empty_list,
 
 			Assert(blkno == metadata->head);
 			LockBuffer(metabuffer, GIN_UNLOCK);
+			INJECTION_POINT("gin-cleanup-after-shift", NULL);
 
 			/*
 			 * if we removed the whole pending list or we cleanup tail (which

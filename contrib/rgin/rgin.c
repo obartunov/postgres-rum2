@@ -44,6 +44,7 @@
 #include "storage/bufmgr.h"
 #include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -224,6 +225,8 @@ typedef struct RginInsertInfo
 	int64		postings;
 	int64		widen;			/* posting-tree entry tuple rewritten */
 	int64		to_tree;		/* posting list converted to a tree */
+	int64		fast_rows;		/* rows written to the pending list */
+	int64		fast_postings;
 } RginInsertInfo;
 
 static RginInsertInfo insert_info;
@@ -359,10 +362,6 @@ rginbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	if (RelationGetNumberOfBlocks(index) != 0)
 		elog(ERROR, "index \"%s\" already contains data", RelationGetRelationName(index));
-	if (rgin_fastupdate(index))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("rgin research prototype requires fastupdate = off")));
 	if (indexInfo->ii_NumIndexAttrs != 1 || indexInfo->ii_IndexAttrNumbers[0] == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -463,10 +462,6 @@ rgininsert(Relation index, Datum *values, bool *isnull,
 	WordEntry  *we;
 	int			dl;
 
-	if (rgin_fastupdate(index))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("rgin research prototype requires fastupdate = off")));
 	if (gs == NULL)
 	{
 		old = MemoryContextSwitchTo(indexInfo->ii_Context);
@@ -483,6 +478,38 @@ rgininsert(Relation index, Datum *values, bool *isnull,
 	tsv = DatumGetTSVector(values[0]);
 	dl = rgin_tsv_dl(tsv);
 	we = ARRPTR(tsv);
+
+	if (rgin_fastupdate(index))
+	{
+		/*
+		 * Same keys and payloads as below, into the pending list.  Lexemes of
+		 * a tsvector are sorted and unique in gin_cmp_tslexeme order.  The
+		 * root metadata of the main structure is not touched; cleanup widens
+		 * it when it moves the postings.
+		 */
+		GinTupleCollector collector;
+		Datum	   *keys = palloc(sizeof(Datum) * Max(tsv->size, 1));
+		GinNullCategory *cats = palloc0(sizeof(GinNullCategory) * Max(tsv->size, 1));
+		char	   *payloads = palloc(W * Max(tsv->size, 1));
+
+		for (int i = 0; i < tsv->size; i++)
+		{
+			keys[i] = PointerGetDatum(cstring_to_text_with_len(STRPTR(tsv) + we[i].pos,
+															   we[i].len));
+			rgin_payload_put(payloads + i * W,
+							 rgin_bm25_payload(rgin_tsv_tf(tsv, &we[i]), dl));
+		}
+		memset(&collector, 0, sizeof(collector));
+		ginHeapTupleFastCollectPayload(gs, &collector, FirstOffsetNumber, keys, cats,
+									   payloads, tsv->size, ht_ctid);
+		ginHeapTupleFastInsert(gs, &collector);
+		insert_info.fast_rows++;
+		insert_info.fast_postings += tsv->size;
+		MemoryContextSwitchTo(old);
+		MemoryContextDelete(ctx);
+		return false;
+	}
+
 	for (int i = 0; i < tsv->size; i++)
 	{
 		char		payload[W];
@@ -525,6 +552,13 @@ rginbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 */
 	return ginbulkdeletePayload(info, stats, callback, callback_state, W,
 								&rgin_bm25_payload_ops);
+}
+
+static IndexBulkDeleteResult *
+rginvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
+{
+	/* also moves the pending list, with payloads, into the main structure */
+	return ginvacuumcleanupPayload(info, stats, W, &rgin_bm25_payload_ops);
 }
 
 /* ---------------------------------------------------------------- posting cursor */
@@ -1707,7 +1741,7 @@ rgin_handler(PG_FUNCTION_ARGS)
 		.aminsert = rgininsert,
 		.aminsertcleanup = NULL,
 		.ambulkdelete = rginbulkdelete,
-		.amvacuumcleanup = ginvacuumcleanup,
+		.amvacuumcleanup = rginvacuumcleanup,
 		.amcanreturn = NULL,
 		.amcostestimate = rgincostestimate,
 		.amgettreeheight = NULL,
@@ -1800,9 +1834,12 @@ rgin_insert_info(PG_FUNCTION_ARGS)
 
 	initStringInfo(&s);
 	appendStringInfo(&s, "{\"rows\":" INT64_FORMAT ",\"postings\":" INT64_FORMAT
-					 ",\"widen\":" INT64_FORMAT ",\"to_tree\":" INT64_FORMAT "}",
+					 ",\"widen\":" INT64_FORMAT ",\"to_tree\":" INT64_FORMAT
+					 ",\"fast_rows\":" INT64_FORMAT ",\"fast_postings\":" INT64_FORMAT
+					 ",\"tree_meta_widen\":" INT64_FORMAT "}",
 					 insert_info.rows, insert_info.postings, insert_info.widen,
-					 insert_info.to_tree);
+					 insert_info.to_tree, insert_info.fast_rows, insert_info.fast_postings,
+					 rgin_tree_meta_widen);
 	PG_RETURN_TEXT_P(cstring_to_text(s.data));
 }
 
@@ -1815,6 +1852,47 @@ open_rgin(Oid indexoid, GinState *gs)
 		elog(ERROR, "\"%s\" is not an rgin index", RelationGetRelationName(index));
 	rgin_init_state(gs, index);
 	return index;
+}
+
+/*
+ * rgin_clean_pending_list(index): gin_clean_pending_list for an rgin index,
+ * moving pending postings with their payloads.  Returns the number of
+ * pending pages deleted.
+ */
+PG_FUNCTION_INFO_V1(rgin_clean_pending_list);
+
+Datum
+rgin_clean_pending_list(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	Relation	index = index_open(indexoid, RowExclusiveLock);
+	IndexBulkDeleteResult stats;
+	GinState	gs;
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress"),
+				 errhint("GIN pending list cannot be cleaned up during recovery.")));
+	if (!rgin_is_rgin_index(index))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not an rgin index", RelationGetRelationName(index))));
+	if (RELATION_IS_OTHER_TEMP(index))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot access temporary indexes of other sessions")));
+	if (!object_ownercheck(RelationRelationId, indexoid, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_INDEX, RelationGetRelationName(index));
+
+	memset(&stats, 0, sizeof(stats));
+	if (index->rd_index->indisvalid)
+	{
+		rgin_init_state(&gs, index);
+		ginInsertCleanup(&gs, true, true, true, &stats);
+	}
+	index_close(index, RowExclusiveLock);
+	PG_RETURN_INT64((int64) stats.pages_deleted);
 }
 
 /* entry metadata of a key, as JSON (NULL if the key is absent) */
@@ -1886,6 +1964,13 @@ typedef struct CheckCounters
 	int64		empty_tree_keys;
 	int64		empty_inline_keys;
 	pg_crc32c	meta_crc;
+	/* pending list */
+	int64		pending_pages;
+	int64		pending_tuples;
+	int64		pending_rows;
+	int64		pending_violations;
+	int64		meta_pending_pages;
+	int64		meta_pending_rows;
 } CheckCounters;
 
 /*
@@ -1977,6 +2062,83 @@ check_tree(Relation index, BlockNumber root, const RginMeta *m, CheckCounters *c
 	}
 }
 
+/*
+ * Pending list: list pages only, linked from head to tail; every tuple a
+ * normal key with exactly W payload bytes, payload not zero; keys of one
+ * heap row in strictly increasing order; per-page row counters summing to
+ * the metapage counters.  The caller must keep the list quiescent.
+ */
+static void
+check_pending(Relation index, GinState *gs, CheckCounters *cc)
+{
+	Buffer		metabuffer = ReadBuffer(index, GIN_METAPAGE_BLKNO);
+	GinMetaPageData *md;
+	BlockNumber blkno,
+				last = InvalidBlockNumber;
+	int64		rowsum = 0;
+	ItemPointerData prevtid;
+	Datum		prevkey = (Datum) 0;
+	bool		haveprev = false;
+
+	LockBuffer(metabuffer, GIN_SHARE);
+	md = GinPageGetMeta(BufferGetPage(metabuffer));
+	cc->meta_pending_pages = md->nPendingPages;
+	cc->meta_pending_rows = md->nPendingHeapTuples;
+	blkno = md->head;
+	if ((md->head == InvalidBlockNumber) != (md->tail == InvalidBlockNumber))
+		cc->pending_violations++;
+	ItemPointerSetInvalid(&prevtid);
+	while (blkno != InvalidBlockNumber)
+	{
+		Buffer		buf = ReadBuffer(index, blkno);
+		Page		page;
+		OffsetNumber maxoff;
+
+		LockBuffer(buf, GIN_SHARE);
+		page = BufferGetPage(buf);
+		cc->pending_pages++;
+		if (!GinPageIsList(page) || GinPageIsDeleted(page))
+		{
+			cc->pending_violations++;
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+		rowsum += GinPageGetOpaque(page)->maxoff;
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			IndexTuple	itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, off));
+			GinNullCategory cat;
+			Datum		key = gintuple_get_key(gs, itup, &cat);
+			int			len;
+			char	   *pl = GinItupGetMeta(itup, &len);
+
+			cc->pending_tuples++;
+			if (cat != GIN_CAT_NORM_KEY || len != W || rgin_payload_get(pl) == 0)
+				cc->pending_violations++;
+			if (!haveprev || !ItemPointerEquals(&prevtid, &itup->t_tid))
+			{
+				cc->pending_rows++;
+				prevtid = itup->t_tid;
+			}
+			else if (ginCompareEntries(gs, FirstOffsetNumber, prevkey, GIN_CAT_NORM_KEY,
+									   key, cat) >= 0)
+				cc->pending_violations++;
+			if (haveprev)
+				pfree(DatumGetPointer(prevkey));
+			prevkey = PointerGetDatum(DatumGetTextPCopy(key));
+			haveprev = true;
+		}
+		last = blkno;
+		blkno = GinPageGetOpaque(page)->rightlink;
+		UnlockReleaseBuffer(buf);
+	}
+	if (last != md->tail || cc->pending_pages != md->nPendingPages ||
+		rowsum != md->nPendingHeapTuples || cc->pending_rows != md->nPendingHeapTuples)
+		cc->pending_violations++;
+	UnlockReleaseBuffer(metabuffer);
+}
+
 Datum
 rgin_check(PG_FUNCTION_ARGS)
 {
@@ -1985,7 +2147,9 @@ rgin_check(PG_FUNCTION_ARGS)
 	CheckCounters cc;
 	BlockNumber levelStart = GIN_ROOT_BLKNO;
 	StringInfoData s;
+	RginIndexMeta im;
 
+	rgin_read_index_meta(index, &im);
 	memset(&cc, 0, sizeof(cc));
 	INIT_CRC32C(cc.meta_crc);
 	for (;;)
@@ -2084,6 +2248,7 @@ rgin_check(PG_FUNCTION_ARGS)
 			break;
 		levelStart = firstChild;
 	}
+	check_pending(index, &gs, &cc);
 	index_close(index, NoLock);
 	FIN_CRC32C(cc.meta_crc);
 
@@ -2098,13 +2263,20 @@ rgin_check(PG_FUNCTION_ARGS)
 					 ",\"order_violations\":" INT64_FORMAT ",\"bound_violations\":" INT64_FORMAT
 					 ",\"tree_without_frontier\":" INT64_FORMAT
 					 ",\"segment_violations\":" INT64_FORMAT ",\"empty_tree_keys\":" INT64_FORMAT
-					 ",\"empty_inline_keys\":" INT64_FORMAT ",\"meta_crc\":\"%08x\"}",
+					 ",\"empty_inline_keys\":" INT64_FORMAT ",\"meta_crc\":\"%08x\""
+					 ",\"pending_pages\":" INT64_FORMAT ",\"pending_tuples\":" INT64_FORMAT
+					 ",\"pending_rows\":" INT64_FORMAT ",\"pending_violations\":" INT64_FORMAT
+					 ",\"meta_pending_pages\":" INT64_FORMAT ",\"meta_pending_rows\":" INT64_FORMAT
+					 ",\"static_N\":" INT64_FORMAT ",\"static_sumdl\":" INT64_FORMAT "}",
 					 cc.entry_pages, cc.interior_tuples, cc.interior_with_meta,
 					 cc.leaf_tuples, cc.tree_keys, cc.inline_keys, cc.keys_with_static,
 					 cc.meta_bytes, cc.frontier_points, cc.postings, cc.data_leaf_pages,
 					 cc.segments, cc.order_violations, cc.bound_violations,
 					 cc.tree_without_frontier, cc.segment_violations, cc.empty_tree_keys,
-					 cc.empty_inline_keys, (unsigned) cc.meta_crc);
+					 cc.empty_inline_keys, (unsigned) cc.meta_crc,
+					 cc.pending_pages, cc.pending_tuples, cc.pending_rows,
+					 cc.pending_violations, cc.meta_pending_pages, cc.meta_pending_rows,
+					 im.N, im.sumdl);
 	PG_RETURN_TEXT_P(cstring_to_text(s.data));
 }
 

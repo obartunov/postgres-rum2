@@ -91,6 +91,7 @@ typedef struct RginIndexMeta
 
 /* ---- BM25 client API (rgin_bm25.c) ---- */
 extern const GinPayloadOps rgin_bm25_payload_ops;
+extern int64 rgin_tree_meta_widen;
 extern void rgin_bm25_init(void);
 extern RginPayload rgin_bm25_payload(int tf, int dl);
 extern int	rgin_tsv_dl(TSVector tsv);

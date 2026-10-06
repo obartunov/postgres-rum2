@@ -63,3 +63,4 @@ CREATE FUNCTION rgin_term_frontier_points(regclass, text) RETURNS int4[] AS 'MOD
 CREATE FUNCTION rgin_check(regclass) RETURNS text AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION rgin_debug_insert(regclass, text, tid, int4) RETURNS int4 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION rgin_term_segments(regclass, text) RETURNS text AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+CREATE FUNCTION rgin_clean_pending_list(regclass) RETURNS bigint AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

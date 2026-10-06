@@ -227,6 +227,13 @@ frontier_union(RginMeta *m, const char *payloads, int n)
 }
 
 /*
+ * Posting-tree metadata changed outside index build, by direct insertion or
+ * pending-list cleanup (including conversion of a posting list to a tree).
+ * Instrumentation only.
+ */
+int64		rgin_tree_meta_widen = 0;
+
+/*
  * GinPayloadOps.metaUpdate: build postings count into df_G (static); a
  * posting-tree key keeps the frontier of all its payloads (dynamic).
  * Posting-list keys carry no frontier: the scan reads their payloads.
@@ -237,6 +244,7 @@ rgin_meta_update(GinState *ginstate, const char *oldmeta, int oldlen,
 				 bool isBuild, bool isTree, char *out, int maxlen)
 {
 	RginMeta	m;
+	int			len;
 
 	rgin_meta_parse(oldmeta, oldlen, &m);
 	if (isBuild)
@@ -246,7 +254,11 @@ rgin_meta_update(GinState *ginstate, const char *oldmeta, int oldlen,
 	}
 	if (isTree)
 		frontier_union(&m, payloads, npayloads);
-	return rgin_meta_encode(&m, out, maxlen);
+	len = rgin_meta_encode(&m, out, maxlen);
+	if (isTree && !isBuild && oldmeta != NULL &&
+		(len != oldlen || memcmp(out, oldmeta, len) != 0))
+		rgin_tree_meta_widen++;
+	return len;
 }
 
 const GinPayloadOps rgin_bm25_payload_ops = {

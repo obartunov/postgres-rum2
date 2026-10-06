@@ -619,6 +619,7 @@ ginEntryInsertPayload(GinState *ginstate,
 				GinNullCategory oldcategory;
 				Datum		oldkey = gintuple_get_key(ginstate, itup, &oldcategory);
 
+				INJECTION_POINT("gin-payload-before-meta-publish", NULL);
 				itup = GinFormTupleMeta(ginstate, attnum, oldkey, oldcategory,
 										NULL, 0, 0, meta, metalen, true);
 				GinSetPostingTree(itup, rootPostingTree);

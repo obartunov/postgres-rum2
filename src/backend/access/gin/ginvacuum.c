@@ -23,6 +23,7 @@
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/read_stream.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 
 struct GinVacuumState
@@ -296,6 +297,7 @@ ginDeletePostingPage(GinVacuumState *gvs, Buffer dBuffer, Buffer lBuffer,
 	}
 
 	END_CRIT_SECTION();
+	INJECTION_POINT("gin-vacuum-after-delete-page", NULL);
 
 	gvs->result->pages_newly_deleted++;
 	gvs->result->pages_deleted++;
@@ -501,6 +503,7 @@ ginVacuumPostingTreeLeaves(GinVacuumState *gvs, BlockNumber blkno)
 		blkno = GinPageGetOpaque(page)->rightlink;
 
 		UnlockReleaseBuffer(buffer);
+		INJECTION_POINT("gin-vacuum-after-data-leaf", NULL);
 
 		if (blkno == InvalidBlockNumber)
 			break;
@@ -859,6 +862,7 @@ ginbulkdeletePayload(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			xlogVacuumPage(gvs.index, buffer);
 			END_CRIT_SECTION();
 			UnlockReleaseBuffer(buffer);
+			INJECTION_POINT("gin-vacuum-after-entry-page", NULL);
 		}
 		else
 		{

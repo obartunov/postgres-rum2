@@ -32,15 +32,17 @@ typedef struct GinOptions
 	int			pendingListCleanupSize; /* maximum size of pending list */
 } GinOptions;
 
+/*
+ * A payload index may belong to another access method that uses the GIN
+ * structure and ginoptions, so only the relkind is checked here.
+ */
 #define GIN_DEFAULT_USE_FASTUPDATE	true
 #define GinGetUseFastUpdate(relation) \
-	(AssertMacro(relation->rd_rel->relkind == RELKIND_INDEX && \
-				 relation->rd_rel->relam == GIN_AM_OID), \
+	(AssertMacro(relation->rd_rel->relkind == RELKIND_INDEX), \
 	 (relation)->rd_options ? \
 	 ((GinOptions *) (relation)->rd_options)->useFastUpdate : GIN_DEFAULT_USE_FASTUPDATE)
 #define GinGetPendingListCleanupSize(relation) \
-	(AssertMacro(relation->rd_rel->relkind == RELKIND_INDEX && \
-				 relation->rd_rel->relam == GIN_AM_OID), \
+	(AssertMacro(relation->rd_rel->relkind == RELKIND_INDEX), \
 	 (relation)->rd_options && \
 	 ((GinOptions *) (relation)->rd_options)->pendingListCleanupSize != -1 ? \
 	 ((GinOptions *) (relation)->rd_options)->pendingListCleanupSize : \
@@ -148,6 +150,24 @@ GinItupGetMeta(IndexTuple itup, int *len)
 	return end - sizeof(uint16) - metalen;
 }
 
+
+/*
+ * A pending-list tuple of a payload index carries the payload of its posting
+ * in the same tail-anchored metadata slot (GIN_ITUP_HAS_META); t_tid is the
+ * heap TID, as for every pending tuple.  Only pending (GIN_LIST) pages hold
+ * such tuples.
+ */
+static inline const char *
+GinPendingTupleGetPayload(IndexTuple itup, int payloadWidth)
+{
+	int			len;
+	char	   *payload = GinItupGetMeta(itup, &len);
+
+	if (len != payloadWidth)
+		elog(ERROR, "GIN pending tuple has %d payload bytes, expected %d",
+			 len, payloadWidth);
+	return payload;
+}
 
 /* ginutil.c */
 extern bytea *ginoptions(Datum reloptions, bool validate);
@@ -580,6 +600,12 @@ extern void ginHeapTupleFastCollect(GinState *ginstate,
 									GinTupleCollector *collector,
 									OffsetNumber attnum, Datum value, bool isNull,
 									ItemPointer ht_ctid);
+extern void ginHeapTupleFastCollectPayload(GinState *ginstate,
+										   GinTupleCollector *collector,
+										   OffsetNumber attnum,
+										   Datum *entries, GinNullCategory *categories,
+										   const char *payloads, int32 nentries,
+										   ItemPointer ht_ctid);
 extern void ginInsertCleanup(GinState *ginstate, bool must_empty_list,
 							 bool fill_fsm, bool forceCleanup, IndexBulkDeleteResult *stats);
 

@@ -477,31 +477,10 @@ ginHeapTupleFastInsert(GinState *ginstate, GinTupleCollector *collector)
 		ginInsertCleanup(ginstate, false, true, false, NULL);
 }
 
-/*
- * Create temporary index tuples for a single indexable item (one index column
- * for the heap tuple specified by ht_ctid), and append them to the array
- * in *collector.  They will subsequently be written out using
- * ginHeapTupleFastInsert.  Note that to guarantee consistent state, all
- * temp tuples for a given heap tuple must be written in one call to
- * ginHeapTupleFastInsert.
- */
-void
-ginHeapTupleFastCollect(GinState *ginstate,
-						GinTupleCollector *collector,
-						OffsetNumber attnum, Datum value, bool isNull,
-						ItemPointer ht_ctid)
+/* Make room in *collector for nentries more tuples */
+static void
+collectorReserve(GinTupleCollector *collector, int32 nentries)
 {
-	Datum	   *entries;
-	GinNullCategory *categories;
-	int32		i,
-				nentries;
-
-	/*
-	 * Extract the key values that need to be inserted in the index
-	 */
-	entries = ginExtractEntries(ginstate, attnum, value, isNull,
-								&nentries, &categories);
-
 	/*
 	 * Protect against integer overflow in allocation calculations
 	 */
@@ -533,6 +512,34 @@ ginHeapTupleFastCollect(GinState *ginstate,
 		collector->tuples = repalloc_array(collector->tuples,
 										   IndexTuple, collector->lentuples);
 	}
+}
+
+/*
+ * Create temporary index tuples for a single indexable item (one index column
+ * for the heap tuple specified by ht_ctid), and append them to the array
+ * in *collector.  They will subsequently be written out using
+ * ginHeapTupleFastInsert.  Note that to guarantee consistent state, all
+ * temp tuples for a given heap tuple must be written in one call to
+ * ginHeapTupleFastInsert.
+ */
+void
+ginHeapTupleFastCollect(GinState *ginstate,
+						GinTupleCollector *collector,
+						OffsetNumber attnum, Datum value, bool isNull,
+						ItemPointer ht_ctid)
+{
+	Datum	   *entries;
+	GinNullCategory *categories;
+	int32		i,
+				nentries;
+
+	/*
+	 * Extract the key values that need to be inserted in the index
+	 */
+	entries = ginExtractEntries(ginstate, attnum, value, isNull,
+								&nentries, &categories);
+
+	collectorReserve(collector, nentries);
 
 	/*
 	 * Build an index tuple for each key value, and add to array.  In pending
@@ -544,6 +551,44 @@ ginHeapTupleFastCollect(GinState *ginstate,
 
 		itup = GinFormTuple(ginstate, attnum, entries[i], categories[i],
 							NULL, 0, 0, true);
+		itup->t_tid = *ht_ctid;
+		collector->tuples[collector->ntuples++] = itup;
+		collector->sumsize += IndexTupleSize(itup);
+	}
+}
+
+/*
+ * ginHeapTupleFastCollect for a payload index.  The caller has extracted the
+ * keys of the item and computed their payloads (nentries * payloadWidth
+ * bytes), the same way it does for a direct insertion.  Keys must be in index
+ * order without duplicates, as ginExtractEntries would return them: scans
+ * and cleanup rely on that order within a heap row.  Each pending tuple
+ * carries its payload as tuple metadata, see GinPendingTupleGetPayload.
+ */
+void
+ginHeapTupleFastCollectPayload(GinState *ginstate,
+							   GinTupleCollector *collector,
+							   OffsetNumber attnum,
+							   Datum *entries, GinNullCategory *categories,
+							   const char *payloads, int32 nentries,
+							   ItemPointer ht_ctid)
+{
+	int			w = ginstate->payloadWidth;
+
+	Assert(w > 0);
+	collectorReserve(collector, nentries);
+
+	for (int32 i = 0; i < nentries; i++)
+	{
+		IndexTuple	itup;
+
+		if (i > 0 && ginCompareEntries(ginstate, attnum,
+									   entries[i - 1], categories[i - 1],
+									   entries[i], categories[i]) >= 0)
+			elog(ERROR, "GIN payload keys of a heap row are not in index order");
+
+		itup = GinFormTupleMeta(ginstate, attnum, entries[i], categories[i],
+								NULL, 0, 0, payloads + (Size) i * w, w, true);
 		itup->t_tid = *ht_ctid;
 		collector->tuples[collector->ntuples++] = itup;
 		collector->sumsize += IndexTupleSize(itup);

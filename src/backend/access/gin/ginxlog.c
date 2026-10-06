@@ -523,6 +523,23 @@ ginRedoDeletePage(XLogReaderState *record)
 		UnlockReleaseBuffer(dbuffer);
 }
 
+/*
+ * A payload index's metapage record carries its GinMetaPageExt as block 0
+ * data, because redo re-initializes the metapage.
+ */
+static void
+ginRedoRestoreMetaExt(XLogReaderState *record, Page metapage)
+{
+	Size		extlen;
+	char	   *ext = XLogRecGetBlockData(record, 0, &extlen);
+
+	if (ext == NULL || extlen != sizeof(GinMetaPageExt))
+		elog(PANIC, "gin_redo: GIN payload metapage record without extension data");
+	memcpy(GinPageGetMetaExt(metapage), ext, extlen);
+	((PageHeader) metapage)->pd_lower =
+		((char *) GinPageGetMetaExt(metapage) + sizeof(GinMetaPageExt)) - (char *) metapage;
+}
+
 static void
 ginRedoUpdateMetapage(XLogReaderState *record)
 {
@@ -544,16 +561,7 @@ ginRedoUpdateMetapage(XLogReaderState *record)
 	GinInitMetabuffer(metabuffer);
 	memcpy(GinPageGetMeta(metapage), &data->metadata, sizeof(GinMetaPageData));
 	if (data->metadata.ginVersion == GIN_PAYLOAD_VERSION)
-	{
-		Size		extlen;
-		char	   *ext = XLogRecGetBlockData(record, 0, &extlen);
-
-		if (ext == NULL || extlen != sizeof(GinMetaPageExt))
-			elog(PANIC, "gin_redo: GIN payload metapage record without extension data");
-		memcpy(GinPageGetMetaExt(metapage), ext, extlen);
-		((PageHeader) metapage)->pd_lower =
-			((char *) GinPageGetMetaExt(metapage) + sizeof(GinMetaPageExt)) - (char *) metapage;
-	}
+		ginRedoRestoreMetaExt(record, metapage);
 	PageSetLSN(metapage, lsn);
 	MarkBufferDirty(metabuffer);
 
@@ -696,6 +704,8 @@ ginRedoDeleteListPages(XLogReaderState *record)
 	GinInitMetabuffer(metabuffer);
 
 	memcpy(GinPageGetMeta(metapage), &data->metadata, sizeof(GinMetaPageData));
+	if (data->metadata.ginVersion == GIN_PAYLOAD_VERSION)
+		ginRedoRestoreMetaExt(record, metapage);
 	PageSetLSN(metapage, lsn);
 	MarkBufferDirty(metabuffer);
 

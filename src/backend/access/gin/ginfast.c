@@ -418,6 +418,9 @@ ginHeapTupleFastInsert(GinState *ginstate, GinTupleCollector *collector)
 	 */
 	((PageHeader) metapage)->pd_lower =
 		((char *) metadata + sizeof(GinMetaPageData)) - (char *) metapage;
+	if (metadata->ginVersion == GIN_PAYLOAD_VERSION)
+		((PageHeader) metapage)->pd_lower =
+			((char *) GinPageGetMetaExt(metapage) + sizeof(GinMetaPageExt)) - (char *) metapage;
 
 	/*
 	 * Write metabuffer, make xlog entry
@@ -431,6 +434,9 @@ ginHeapTupleFastInsert(GinState *ginstate, GinTupleCollector *collector)
 		memcpy(&data.metadata, metadata, sizeof(GinMetaPageData));
 
 		XLogRegisterBuffer(0, metabuffer, REGBUF_WILL_INIT | REGBUF_STANDARD);
+		/* redo re-initializes the metapage, see ginUpdateStats */
+		if (metadata->ginVersion == GIN_PAYLOAD_VERSION)
+			XLogRegisterBufData(0, GinPageGetMetaExt(metapage), sizeof(GinMetaPageExt));
 		XLogRegisterData(&data, sizeof(ginxlogUpdateMeta));
 
 		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_UPDATE_META_PAGE);
@@ -624,6 +630,9 @@ shiftList(Relation index, Buffer metabuffer, BlockNumber newHead,
 		 */
 		((PageHeader) metapage)->pd_lower =
 			((char *) metadata + sizeof(GinMetaPageData)) - (char *) metapage;
+		if (metadata->ginVersion == GIN_PAYLOAD_VERSION)
+			((PageHeader) metapage)->pd_lower =
+				((char *) GinPageGetMetaExt(metapage) + sizeof(GinMetaPageExt)) - (char *) metapage;
 
 		MarkBufferDirty(metabuffer);
 
@@ -641,6 +650,9 @@ shiftList(Relation index, Buffer metabuffer, BlockNumber newHead,
 			XLogBeginInsert();
 			XLogRegisterBuffer(0, metabuffer,
 							   REGBUF_WILL_INIT | REGBUF_STANDARD);
+			if (metadata->ginVersion == GIN_PAYLOAD_VERSION)
+				XLogRegisterBufData(0, GinPageGetMetaExt(metapage),
+									sizeof(GinMetaPageExt));
 			for (i = 0; i < data.ndeleted; i++)
 				XLogRegisterBuffer(i + 1, buffers[i], REGBUF_WILL_INIT);
 

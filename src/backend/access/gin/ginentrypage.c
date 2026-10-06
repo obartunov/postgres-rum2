@@ -189,6 +189,25 @@ GinFormTupleMeta(GinState *ginstate,
 }
 
 /*
+ * Form a copy of leaf entry tuple 'itup' with a new posting list, keeping
+ * its key and its opaque metadata (if any) byte-for-byte.
+ */
+IndexTuple
+GinFormTupleKeepMeta(GinState *ginstate, IndexTuple itup,
+					 Pointer data, Size dataSize, int nipd)
+{
+	OffsetNumber attnum = gintuple_get_attrnum(ginstate, itup);
+	GinNullCategory category;
+	Datum		key = gintuple_get_key(ginstate, itup, &category);
+	int			metalen;
+	char	   *meta = GinItupGetMeta(itup, &metalen);
+
+	Assert(!GinIsPostingTree(itup));
+	return GinFormTupleMeta(ginstate, attnum, key, category, data, dataSize,
+							nipd, meta, metalen, true);
+}
+
+/*
  * Read item pointers and payloads from a leaf entry tuple of a payload index.
  */
 ItemPointer

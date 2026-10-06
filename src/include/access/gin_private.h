@@ -295,6 +295,8 @@ extern IndexTuple GinFormTupleMeta(GinState *ginstate,
 								   const char *meta, int metalen, bool errorTooBig);
 extern ItemPointer ginReadTuplePayload(GinState *ginstate, OffsetNumber attnum,
 									   IndexTuple itup, int *nitems, char **payloads);
+extern IndexTuple GinFormTupleKeepMeta(GinState *ginstate, IndexTuple itup,
+									   Pointer data, Size dataSize, int nipd);
 
 /* gindatapage.c */
 extern ItemPointer GinDataLeafPageGetItems(Page page, int *nitems, ItemPointerData advancePast);
@@ -502,6 +504,16 @@ extern IndexBulkDeleteResult *ginvacuumcleanup(IndexVacuumInfo *info,
 											   IndexBulkDeleteResult *stats);
 extern ItemPointer ginVacuumItemPointers(GinVacuumState *gvs,
 										 ItemPointerData *items, int nitem, int *nremaining);
+extern IndexBulkDeleteResult *ginbulkdeletePayload(IndexVacuumInfo *info,
+												   IndexBulkDeleteResult *stats,
+												   IndexBulkDeleteCallback callback,
+												   void *callback_state,
+												   int payloadWidth);
+extern ItemPointer ginVacuumItemPointersPayload(GinVacuumState *gvs,
+												ItemPointerData *items, char *payloads,
+												int payloadWidth, int nitem,
+												int *nremaining, char **payloads_out);
+extern int	ginVacuumStatePayloadWidth(GinVacuumState *gvs);
 
 /* ginvalidate.c */
 extern bool ginvalidate(Oid opclassoid);

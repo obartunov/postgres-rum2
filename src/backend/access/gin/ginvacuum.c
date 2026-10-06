@@ -84,6 +84,60 @@ ginVacuumItemPointers(GinVacuumState *gvs, ItemPointerData *items,
 }
 
 /*
+ * ginVacuumItemPointers for a payload index: one selection, applied to the
+ * TIDs and their payloads together.  If nothing is removed, returns NULL.
+ * Otherwise returns the remaining items and sets *payloads_out to their
+ * payloads, in the same order.
+ */
+ItemPointer
+ginVacuumItemPointersPayload(GinVacuumState *gvs, ItemPointerData *items,
+							 char *payloads, int payloadWidth, int nitem,
+							 int *nremaining, char **payloads_out)
+{
+	int			i,
+				remaining = 0;
+	ItemPointer tmpitems = NULL;
+	char	   *tmppayloads = NULL;
+
+	Assert(payloadWidth > 0);
+	for (i = 0; i < nitem; i++)
+	{
+		if (gvs->callback(items + i, gvs->callback_state))
+		{
+			gvs->result->tuples_removed += 1;
+			if (!tmpitems)
+			{
+				tmpitems = palloc_array(ItemPointerData, nitem);
+				tmppayloads = palloc((Size) nitem * payloadWidth);
+				memcpy(tmpitems, items, sizeof(ItemPointerData) * i);
+				memcpy(tmppayloads, payloads, (Size) i * payloadWidth);
+			}
+		}
+		else
+		{
+			gvs->result->num_index_tuples += 1;
+			if (tmpitems)
+			{
+				tmpitems[remaining] = items[i];
+				memcpy(tmppayloads + (Size) remaining * payloadWidth,
+					   payloads + (Size) i * payloadWidth, payloadWidth);
+			}
+			remaining++;
+		}
+	}
+
+	*nremaining = remaining;
+	*payloads_out = tmppayloads;
+	return tmpitems;
+}
+
+int
+ginVacuumStatePayloadWidth(GinVacuumState *gvs)
+{
+	return gvs->ginstate.payloadWidth;
+}
+
+/*
  * Create a WAL record for vacuuming entry tree leaf page.
  */
 static void
@@ -543,6 +597,68 @@ ginVacuumEntryPage(GinVacuumState *gvs, Buffer buffer, BlockNumber *roots, uint3
 			roots[*nroot] = GinGetDownlink(itup);
 			(*nroot)++;
 		}
+		else if (GinGetNPosting(itup) > 0 && gvs->ginstate.payloadWidth > 0)
+		{
+			int			w = gvs->ginstate.payloadWidth;
+			int			nitems;
+			char	   *payloads_orig;
+			char	   *payloads;
+			ItemPointer items_orig;
+			ItemPointer items;
+
+			items_orig = ginReadTuplePayload(&gvs->ginstate, FirstOffsetNumber,
+											 itup, &nitems, &payloads_orig);
+			items = ginVacuumItemPointersPayload(gvs, items_orig, payloads_orig, w,
+												 nitems, &nitems, &payloads);
+			pfree(items_orig);
+			pfree(payloads_orig);
+
+			if (items)
+			{
+				GinPostingList *plist = NULL;
+				int			plistsize = 0;
+				Size		oldsize = IndexTupleSize(itup);
+
+				if (nitems > 0)
+				{
+					int			npacked;
+
+					plist = ginCompressPostingListPayload(items, payloads, w, nitems,
+														  GinMaxItemSize, &npacked);
+					/* removing items never makes a posting list longer */
+					if (npacked != nitems)
+						elog(ERROR, "could not fit vacuumed GIN payload posting list");
+					plistsize = SizeOfGinPostingList(plist);
+				}
+
+				if (tmppage == origpage)
+				{
+					tmppage = PageGetTempPageCopy(origpage);
+					itup = (IndexTuple) PageGetItem(tmppage, PageGetItemId(tmppage, i));
+				}
+
+				/*
+				 * Same key and same opaque metadata, smaller posting list.  The
+				 * metadata is kept byte-for-byte (a summary may become wider
+				 * than the remaining postings, which is safe), so the tuple
+				 * cannot grow and is replaced in place without a page split.
+				 */
+				itup = GinFormTupleKeepMeta(&gvs->ginstate, itup, (char *) plist,
+											plistsize, nitems);
+				if (IndexTupleSize(itup) > oldsize)
+					elog(ERROR, "vacuumed GIN entry tuple grew from %zu to %zu bytes",
+						 oldsize, (Size) IndexTupleSize(itup));
+				if (plist)
+					pfree(plist);
+				PageIndexTupleDelete(tmppage, i);
+				if (PageAddItem(tmppage, itup, IndexTupleSize(itup), i, false, false) != i)
+					elog(ERROR, "failed to add item to index page in \"%s\"",
+						 RelationGetRelationName(gvs->index));
+				pfree(itup);
+				pfree(items);
+				pfree(payloads);
+			}
+		}
 		else if (GinGetNPosting(itup) > 0)
 		{
 			int			nitems;
@@ -631,6 +747,19 @@ IndexBulkDeleteResult *
 ginbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			  IndexBulkDeleteCallback callback, void *callback_state)
 {
+	return ginbulkdeletePayload(info, stats, callback, callback_state, 0);
+}
+
+/*
+ * Bulk delete for an index with posting payload width payloadWidth (0 for
+ * ordinary GIN).  A posting and its payload are removed together; entry
+ * tuple metadata is kept unchanged.
+ */
+IndexBulkDeleteResult *
+ginbulkdeletePayload(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+					 IndexBulkDeleteCallback callback, void *callback_state,
+					 int payloadWidth)
+{
 	Relation	index = info->index;
 	BlockNumber blkno = GIN_ROOT_BLKNO;
 	GinVacuumState gvs;
@@ -646,6 +775,7 @@ ginbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	gvs.callback_state = callback_state;
 	gvs.strategy = info->strategy;
 	initGinState(&gvs.ginstate, index);
+	gvs.ginstate.payloadWidth = payloadWidth;
 
 	/* first time through? */
 	if (stats == NULL)

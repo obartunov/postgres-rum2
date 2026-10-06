@@ -808,6 +808,7 @@ ginVacuumPostingTreeLeaf(Relation indexrel, Buffer buffer, GinVacuumState *gvs)
 	dlist_iter	iter;
 
 	leaf = disassembleLeaf(page);
+	leaf->payloadWidth = ginVacuumStatePayloadWidth(gvs);
 
 	/* Vacuum each segment. */
 	dlist_foreach(iter, &leaf->segments)
@@ -815,22 +816,33 @@ ginVacuumPostingTreeLeaf(Relation indexrel, Buffer buffer, GinVacuumState *gvs)
 		leafSegmentInfo *seginfo = dlist_container(leafSegmentInfo, node, iter.cur);
 		int			oldsegsize;
 		ItemPointer cleaned;
+		char	   *cleanedpayloads = NULL;
 		int			ncleaned;
 
-		if (!seginfo->items)
-			seginfo->items = ginPostingListDecode(seginfo->seg,
-												  &seginfo->nitems);
+		leafSegmentDecode(leaf, seginfo);
 		if (seginfo->seg)
 			oldsegsize = SizeOfGinPostingList(seginfo->seg);
 		else
 			oldsegsize = GinDataPageMaxDataSize;
 
-		cleaned = ginVacuumItemPointers(gvs,
-										seginfo->items,
-										seginfo->nitems,
-										&ncleaned);
+		if (leaf->payloadWidth > 0)
+			cleaned = ginVacuumItemPointersPayload(gvs,
+												   seginfo->items,
+												   seginfo->payloads,
+												   leaf->payloadWidth,
+												   seginfo->nitems,
+												   &ncleaned,
+												   &cleanedpayloads);
+		else
+			cleaned = ginVacuumItemPointers(gvs,
+											seginfo->items,
+											seginfo->nitems,
+											&ncleaned);
 		pfree(seginfo->items);
 		seginfo->items = NULL;
+		if (seginfo->payloads)
+			pfree(seginfo->payloads);
+		seginfo->payloads = NULL;
 		seginfo->nitems = 0;
 		if (cleaned)
 		{
@@ -838,10 +850,18 @@ ginVacuumPostingTreeLeaf(Relation indexrel, Buffer buffer, GinVacuumState *gvs)
 			{
 				int			npacked;
 
-				seginfo->seg = ginCompressPostingList(cleaned,
-													  ncleaned,
-													  oldsegsize,
-													  &npacked);
+				if (leaf->payloadWidth > 0)
+					seginfo->seg = ginCompressPostingListPayload(cleaned,
+																 cleanedpayloads,
+																 leaf->payloadWidth,
+																 ncleaned,
+																 oldsegsize,
+																 &npacked);
+				else
+					seginfo->seg = ginCompressPostingList(cleaned,
+														  ncleaned,
+														  oldsegsize,
+														  &npacked);
 				/* Removing an item never increases the size of the segment */
 				if (npacked != ncleaned)
 					elog(ERROR, "could not fit vacuumed posting list");
